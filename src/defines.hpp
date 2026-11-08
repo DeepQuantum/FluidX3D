@@ -84,6 +84,7 @@ inline float vs_q_runtime = vs_env_float("VS_Q", 0.0001f);
 #undef UPDATE_FIELDS
 #undef VOLUME_FORCE
 #undef FORCE_FIELD
+#undef FORCE_SUM
 #undef MOVING_BOUNDARIES
 #undef EQUILIBRIUM_BOUNDARIES
 #undef SURFACE
@@ -94,6 +95,10 @@ inline float vs_q_runtime = vs_env_float("VS_Q", 0.0001f);
 #undef INTERACTIVE_GRAPHICS_ASCII
 #undef GRAPHICS
 #endif // BENCHMARK
+
+#if defined(FORCE_FIELD) && defined(FORCE_SUM)
+#error "FORCE_FIELD and FORCE_SUM are alternatives; define only one."
+#endif // FORCE_FIELD && FORCE_SUM
 
 #ifdef SURFACE // (rho, u) need to be updated exactly every LBM step
 #define UPDATE_FIELDS // update (rho, u, T) in every LBM step

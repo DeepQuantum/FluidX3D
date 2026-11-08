@@ -1939,6 +1939,8 @@ string opencl_c_container() { return R( // ########################## begin of O
 	if(n>=(uxx)def_N) return; // execute reset_force_field() also on halo
 	store3(F, n, (float3)(0.0f, 0.0f, 0.0f));
 } // reset_force_field()
+)+"#endif"+R( // FORCE_FIELD
+)+"#if defined(FORCE_FIELD)||defined(FORCE_SUM)"+R(
 )+R(void atomic_add_f(volatile global float* addr, const float val) {
 )+"#if cl_nv_compute_capability>=20"+R( // use hardware-supported atomic addition on Nvidia GPUs with inline PTX assembly
 	float ret;)+"asm volatile(\"atom.global.add.f32\t%0,[%1],%2;\":\"=f\"(ret):\"l\"(addr),\"f\"(val):\"memory\");"+R(
@@ -1956,7 +1958,7 @@ string opencl_c_container() { return R( // ########################## begin of O
 	local float3 cache[cl_workgroup_size];
 	local uint cells[cl_workgroup_size];
 	const uint is_part_of_object = (uint)(n<(uxx)def_N&&flags[n]==flag_marker);
-	cache[lid] = is_part_of_object ? position(coordinates(n)) : (float3)(0.0f, 0.0f, 0.0f);
+	cache[lid] = is_part_of_object ? position(coordinates(n))+(float3)(def_domain_offset_x, def_domain_offset_y, def_domain_offset_z) : (float3)(0.0f, 0.0f, 0.0f);
 	cells[lid] = is_part_of_object;
 	barrier(CLK_LOCAL_MEM_FENCE);
 	for(uint s=1u; s<cl_workgroup_size; s*=2u) {
@@ -1975,6 +1977,8 @@ string opencl_c_container() { return R( // ########################## begin of O
 		atomic_add((volatile global uint*)&object_sum[3], local_cells);
 	}
 } // object_center_of_mass()
+)+"#endif"+R( // FORCE_FIELD||FORCE_SUM
+)+"#ifdef FORCE_FIELD"+R(
 )+R(kernel void object_force(const global float* F, const global uchar* flags, const uchar flag_marker, volatile global float* object_sum) {
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	const uint lid = get_local_id(0); // local memory reduction of cl_workgroup_size:1
@@ -1996,7 +2000,7 @@ string opencl_c_container() { return R( // ########################## begin of O
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	const uint lid = get_local_id(0); // local memory reduction of cl_workgroup_size:1
 	local float3 cache[cl_workgroup_size];
-	cache[lid] = n<(uxx)def_N&&flags[n]==flag_marker ? cross(position(coordinates(n))-(float3)(cx, cy, cz), load3(F, n)) : (float3)(0.0f, 0.0f, 0.0f);
+	cache[lid] = n<(uxx)def_N&&flags[n]==flag_marker ? cross(position(coordinates(n))+(float3)(def_domain_offset_x, def_domain_offset_y, def_domain_offset_z)-(float3)(cx, cy, cz), load3(F, n)) : (float3)(0.0f, 0.0f, 0.0f);
 	barrier(CLK_LOCAL_MEM_FENCE);
 	for(uint s=1u; s<cl_workgroup_size; s*=2u) {
 		if(lid%(2u*s)==0u) cache[lid] += cache[lid+s];
@@ -2010,6 +2014,41 @@ string opencl_c_container() { return R( // ########################## begin of O
 	}
 } // object_torque()
 )+"#endif"+R( // FORCE_FIELD
+)+"#ifdef FORCE_SUM"+R(
+)+R(kernel void object_force_torque(const global fpxx* fi, const global uchar* flags, const ulong t, const uchar flag_marker, global double* object_partial) {
+	const uint lid = get_local_id(0);
+	local double cache[6u*cl_workgroup_size];
+	double sum[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+	if((flag_marker&TYPE_BO)==TYPE_S) {
+		for(ulong m=get_global_id(0); m<def_N; m+=get_global_size(0)) {
+			const uxx n = (uxx)m;
+			if(flags[n]!=flag_marker||is_halo(n)) continue;
+			uxx j[def_velocity_set];
+			neighbors(n, j);
+			float fhn[def_velocity_set];
+			load_f(n, fhn, fi, j, t);
+			float Fb=1.0f, fx=0.0f, fy=0.0f, fz=0.0f;
+			calculate_rho_u(fhn, &Fb, &fx, &fy, &fz);
+			const float3 Fn = 2.0f*Fb*(float3)(fx, fy, fz);
+			const float3 p = position(coordinates(n))+(float3)(def_domain_offset_x, def_domain_offset_y, def_domain_offset_z);
+			const double Fx=(double)Fn.x, Fy=(double)Fn.y, Fz=(double)Fn.z, px=(double)p.x, py=(double)p.y, pz=(double)p.z;
+			sum[0] += Fx;
+			sum[1] += Fy;
+			sum[2] += Fz;
+			sum[3] += py*Fz-pz*Fy;
+			sum[4] += pz*Fx-px*Fz;
+			sum[5] += px*Fy-py*Fx;
+		}
+	}
+	for(uint k=0u; k<6u; k++) cache[k*cl_workgroup_size+lid] = sum[k];
+	barrier(CLK_LOCAL_MEM_FENCE);
+	for(uint s=cl_workgroup_size/2u; s>0u; s/=2u) {
+		if(lid<s) for(uint k=0u; k<6u; k++) cache[k*cl_workgroup_size+lid] += cache[k*cl_workgroup_size+lid+s];
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+	if(lid<6u) object_partial[6u*get_group_id(0)+lid] = cache[lid*cl_workgroup_size];
+} // object_force_torque()
+)+"#endif"+R( // FORCE_SUM
 
 )+"#ifdef PARTICLES"+R(
 )+"#ifdef FORCE_FIELD"+R(
@@ -2394,6 +2433,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+R(bool is_halo_mc(const uint3 xyz) {
 	return ((def_Dx>1u)&(xyz.x==0u||xyz.x>=def_Nx-2u))||((def_Dy>1u)&(xyz.y==0u||xyz.y>=def_Ny-2u))||((def_Dz>1u)&(xyz.z==0u||xyz.z>=def_Nz-2u)); // halo data is kept up-to-date, so allow using halo data for rendering
 }
+)+R(bool is_halo_mc_seam(const uint3 xyz) {
+	return ((def_Dx>1u)&(xyz.x==0u||xyz.x>=def_Nx-2u))||((def_Dy>1u)&(xyz.y==0u||(xyz.y>=def_Ny-2u&&def_Oy+(int)def_Ny-1>=(int)def_GNy)))||((def_Dz>1u)&(xyz.z==0u||xyz.z>=def_Nz-2u));
+}
 )+R(void calculate_j8(const uint3 xyz, uxx* j) {
 	const uxx x0 = (uxx)  xyz.x; // cube stencil
 	const uxx xp = (uxx) (xyz.x+1u);
@@ -2560,11 +2602,11 @@ string opencl_c_container() { return R( // ########################## begin of O
 		}
 	}
 	barrier(CLK_LOCAL_MEM_FENCE);
-	if(xyz.x>=def_Nx-1u||xyz.y>=def_Ny-1u||xyz.z>=def_Nz-1u||is_halo_mc(xyz)) return; // don't execute graphics_flags_mc() on marching-cubes halo
+	if(xyz.x>=def_Nx-1u||xyz.y>=def_Ny-1u||xyz.z>=def_Nz-1u||is_halo_mc_seam(xyz)) return; // don't execute graphics_flags_mc() on marching-cubes halo
 )+"#else"+R( // do not use local memory
 	if(n>=(uxx)(def_Nx-1u)*(uxx)(def_Ny-1u)*(uxx)(def_Nz-1u)) return;
 	const uint3 xyz = coordinates_mc(n);
-	if(is_halo_mc(xyz)) return; // don't execute graphics_flags_mc() on marching-cubes halo
+	if(is_halo_mc_seam(xyz)) return; // don't execute graphics_flags_mc() on marching-cubes halo
 )+"#endif"+R( // do not use local memory
 	const float3 p = position(xyz);
 	float camera_cache[15]; // cache camera parameters in case the kernel draws more than one shape
@@ -2930,7 +2972,7 @@ string opencl_c_container() { return R( // ########################## begin of O
 	draw_triangle(p0, p1, p2, c, camera_cache, bitmap, zbuffer);
 }
 
-)+R(kernel void graphics_q)+"("+R(const global float* camera, global int* bitmap, global int* zbuffer, const int field_mode, const float q_min, const global float* rho, const global float* u // ) {
+)+R(kernel void graphics_q)+"("+R(const global float* camera, global int* bitmap, global int* zbuffer, const int field_mode, const float q_min, const global float* rho, const global float* u, const global float* u_ghost // ) {
 )+"#ifdef SURFACE"+R(
 	, const global uchar* flags // argument order is important
 )+"#endif"+R( // SURFACE
@@ -2954,12 +2996,18 @@ string opencl_c_container() { return R( // ########################## begin of O
 		if(n_local_c<(LSQ+3u)*(LSQ+3u)*(LSQ+3u)) {
 			const uint t_local_c = n_local_c%((LSQ+3u)*(LSQ+3u));
 			const uint3 xyz_local_c = (uint3)(t_local_c%(LSQ+3u), t_local_c/(LSQ+3u), n_local_c/((LSQ+3u)*(LSQ+3u))); // n = x+(y+z*Ny)*Nx
-			const uint3 xyz_global_c = (LSQ*xyz_global+xyz_local_c+(uint3)(def_Nx-1u, def_Ny-1u, def_Nz-1u))%(uint3)(def_Nx, def_Ny, def_Nz); // shift by -1 cell and apply periodic boundaries
-			u_cache[n_local_c] = load3(u, index(xyz_global_c)); // load u from global memory into local memory
+			const uint3 xyz_shift_c = LSQ*xyz_global+xyz_local_c;
+			const uint3 xyz_global_c = (xyz_shift_c+(uint3)(def_Nx-1u, def_Ny-1u, def_Nz-1u))%(uint3)(def_Nx, def_Ny, def_Nz); // shift by -1 cell and apply periodic boundaries
+			if(def_Dy>1u&&xyz_shift_c.y==def_Ny+1u) {
+				const uint g = xyz_global_c.x+xyz_global_c.z*def_Nx;
+				u_cache[n_local_c] = (float3)(u_ghost[g], u_ghost[def_Nx*def_Nz+g], u_ghost[2u*def_Nx*def_Nz+g]);
+			} else {
+				u_cache[n_local_c] = load3(u, index(xyz_global_c)); // load u from global memory into local memory
+			}
 		}
 	}
 	barrier(CLK_LOCAL_MEM_FENCE);
-	if(xyz.x>=def_Nx-1u||xyz.y>=def_Ny-1u||xyz.z>=def_Nz-1u||is_halo_mc(xyz)) return; // don't execute graphics_q() on marching-cubes halo
+	if(xyz.x>=def_Nx-1u||xyz.y>=def_Ny-1u||xyz.z>=def_Nz-1u||is_halo_mc_seam(xyz)) return; // don't execute graphics_q() on marching-cubes halo
 )+"#else"+R( // do not use local memory
 	if(n>=(uxx)(def_Nx-1u)*(uxx)(def_Ny-1u)*(uxx)(def_Nz-1u)) return;
 	const uint3 xyz = coordinates_mc(n);

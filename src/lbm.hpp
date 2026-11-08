@@ -11,9 +11,12 @@ uint bytes_per_cell_host(); // returns the number of Bytes per cell allocated in
 uint bytes_per_cell_device(); // returns the number of Bytes per cell allocated in device memory
 uint bandwidth_bytes_per_cell_device(); // returns the bandwidth in Bytes per cell per time step from/to device memory
 uint3 resolution(const float3 box_aspect_ratio, const uint memory); // input: simulation box aspect ratio and VRAM occupation in MB, output: grid resolution
+uint voxelize_direction(const Mesh* mesh, const float3& rotational_velocity);
 
 string default_filename(const string& path, const string& name, const string& extension, const ulong t); // generate a default filename with timestamp
 string default_filename(const string& name, const string& extension, const ulong t); // generate a default filename with timestamp at exe_path/export/
+
+constexpr uint force_sum_groups = 4096u;
 
 #pragma warning(disable:26812)
 enum enum_transfer_field { fi, rho_u_flags, flags, F, phi_massex_flags, gi, T, enum_transfer_field_length };
@@ -39,10 +42,15 @@ private:
 	Kernel kernel_update_fields; // reads DDFs and updates (rho, u, T) in device memory
 	Memory<fpxx> fi; // LBM density distribution functions (DDFs); only exist in device memory
 	ulong t_last_update_fields = max_ulong; // optimization to not call kernel_update_fields multiple times if (rho, u, T) are already up-to-date
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
+	Kernel kernel_object_center_of_mass; // calculate center of mass of all cells flagged with flag_marker
+#endif // FORCE_FIELD||FORCE_SUM
+#ifdef FORCE_SUM
+	Kernel kernel_object_force_torque;
+#endif // FORCE_SUM
 #ifdef FORCE_FIELD
 	Kernel kernel_update_force_field; // calculate forces from fluid on TYPE_S cells
 	Kernel kernel_reset_force_field; // reset force field (also on TYPE_S cells)
-	Kernel kernel_object_center_of_mass; // calculate center of mass of all cells flagged with flag_marker
 	Kernel kernel_object_force; // add up force for all cells flagged with flag_marker
 	Kernel kernel_object_torque; // add up torque around specified rotation_center for all cells flagged with flag_marker
 	ulong t_last_force_field = max_ulong; // optimization to not call kernel_update_force_field multiple times if F is already up-to-date
@@ -67,6 +75,8 @@ private:
 
 	const cl::Buffer* fi_slot = nullptr;
 	fpxx* fi_host = nullptr;
+	const cl::Buffer* gi_slot = nullptr;
+	fpxx* gi_host = nullptr;
 
 	void allocate(Device& device); // allocate all memory for data fields on host and device and set up kernels
 	string device_defines(const Device_Info& device_info) const; // returns preprocessor constants for embedding in OpenCL C code
@@ -75,10 +85,18 @@ public:
 	Memory<float> rho; // density of every cell
 	Memory<float> u; // velocity of every cell
 	Memory<uchar> flags; // flags of every cell
+#ifdef GRAPHICS
+	Memory<float> u_ghost;
+#endif // GRAPHICS
 #ifdef FORCE_FIELD
 	Memory<float> F; // individual force for every cell
-	Memory<float> object_sum; // sum of individual cell data for an object
 #endif // FORCE_FIELD
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
+	Memory<float> object_sum; // sum of individual cell data for an object
+#endif // FORCE_FIELD||FORCE_SUM
+#ifdef FORCE_SUM
+	Memory<double> object_partial;
+#endif // FORCE_SUM
 #ifdef SURFACE
 	Memory<float> phi; // fill level of every cell
 #endif // SURFACE
@@ -98,7 +116,7 @@ public:
 	void enqueue_transfer_extract_host(Kernel& kernel_transfer_extract_field, const uint direction, const uint bytes_per_cell, const ulong t, void* host_p, void* host_m);
 	void enqueue_transfer_insert_host(Kernel& kernel_transfer_insert_field, const uint direction, const uint bytes_per_cell, const ulong t, const void* host_p, const void* host_m);
 
-	LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho, const cl::Buffer* fi_slot=nullptr, fpxx* fi_host=nullptr); // compiles OpenCL C code and allocates memory
+	LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho, const cl::Buffer* fi_slot=nullptr, fpxx* fi_host=nullptr, const cl::Buffer* gi_slot=nullptr, fpxx* gi_host=nullptr); // compiles OpenCL C code and allocates memory
 
 	void enqueue_initialize(); // write all data fields to device and call kernel_initialize
 	void enqueue_stream_collide(); // call kernel_stream_collide to perform one LBM time step
@@ -109,9 +127,15 @@ public:
 	void enqueue_surface_2();
 	void enqueue_surface_3();
 #endif // SURFACE
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
+	void enqueue_object_center_of_mass(const uchar flag_marker=TYPE_S); // calculate center of mass of all cells flagged with flag_marker
+#endif // FORCE_FIELD||FORCE_SUM
+#ifdef FORCE_SUM
+	void enqueue_object_force_torque(const uchar flag_marker);
+#endif // FORCE_SUM
 #ifdef FORCE_FIELD
 	void enqueue_update_force_field(); // calculate forces from fluid on TYPE_S cells
-	void enqueue_object_center_of_mass(const uchar flag_marker=TYPE_S); // calculate center of mass of all cells flagged with flag_marker
+	bool force_field_current() const { return t_last_force_field==t; }
 	void enqueue_object_force(const uchar flag_marker=TYPE_S); // add up force for all cells flagged with flag_marker
 	void enqueue_object_torque(const float3& rotation_center, const uchar flag_marker=TYPE_S); // add up torque around specified rotation_center for all cells flagged with flag_marker
 #endif // FORCE_FIELD
@@ -238,19 +262,20 @@ private:
 
 	void communicate_field(const enum_transfer_field field, const uint bytes_per_cell);
 
-	enum ooc_visit_kind { ooc_step, ooc_work, ooc_init };
+	enum ooc_visit_kind { ooc_step, ooc_work, ooc_init, ooc_modify };
 	struct Out_Of_Core {
 		bool active = false;
 		uint resident = 0u, slots = 0u;
-		ulong fi_bytes = 0ull, stage_bytes[2] = { 0ull, 0ull };
+		ulong fi_bytes = 0ull, swap_bytes = 0ull, stage_bytes[4] = { 0ull, 0ull, 0ull, 0ull };
 		vector<int> slot_of;
-		vector<cl::Buffer> slot_fi;
+		vector<cl::Buffer> slot_mem, slot_fi, slot_gi;
 		vector<cl::Buffer> pinned_handles;
 		vector<void*> pinned_blocks;
 		vector<fpxx*> host_fi;
-		vector<char*> stage[2][2][2];
+		vector<char*> stage[4][2][2];
 		cl::CommandQueue queue_up, queue_down;
 		vector<cl::Event> slot_free, host_fi_ready, extract_done[2], in_flight[2];
+		vector<char> keep_halo;
 		bool pending_fi = false, pending_rho_u_flags = false;
 		ulong pending_t = 0ull;
 		uint pending_generation = 0u;
@@ -261,6 +286,19 @@ private:
 	void ooc_visit(const uint d, const ooc_visit_kind kind, const uint generation, const std::function<void(LBM_Domain&)>& work);
 	void ooc_time_step();
 	void ooc_finish();
+	void ooc_modify_domains(const bool all, const float y0, const float y1, const std::function<void(LBM_Domain&)>& work);
+#ifdef FORCE_SUM
+	struct Object_Sums {
+		ulong t = max_ulong;
+		uchar flag = 0u;
+		double F[3] = { 0.0, 0.0, 0.0 }, M[3] = { 0.0, 0.0, 0.0 };
+	} object_sums;
+	void object_sums_invalidate() { object_sums.t = max_ulong; }
+	void object_force_torque(const uchar flag_marker);
+#endif // FORCE_SUM
+#ifdef MOVING_BOUNDARIES
+	void enqueue_moving_boundaries_and_flags();
+#endif // MOVING_BOUNDARIES
 
 	void communicate_fi();
 	void communicate_rho_u_flags();
@@ -487,8 +525,14 @@ public:
 	ulong out_of_core_uploaded() const { return ooc.uploaded; }
 	ulong out_of_core_downloaded() const { return ooc.downloaded; }
 	void print_field_hashes();
+	void write_global_fields(const string& path);
+#ifdef GRAPHICS
+	void fill_u_ghost();
+#endif // GRAPHICS
 #ifdef FORCE_FIELD
 	void update_force_field(); // calculate forces from fluid on TYPE_S cells
+#endif // FORCE_FIELD
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
 	float3 object_center_of_mass(const uchar flag_marker=TYPE_S); // calculate center of mass of all cells flagged with flag_marker
 	float3 object_force(const uchar flag_marker=TYPE_S); // add up force for all cells flagged with flag_marker
 	float3 object_torque(const float3& rotation_center, const uchar flag_marker=TYPE_S); // add up torque around specified rotation_center for all cells flagged with flag_marker

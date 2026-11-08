@@ -128,7 +128,9 @@ void main_setup() {
 	const uint domains_y = (uint)env_u("VS_DY", 1ull);
 	const float target_dx = env_f("VS_DX", 0.0f);
 	uint3 lbm_N = target_dx>0.0f ? uint3(to_uint(box_x/target_dx), to_uint(box_y/target_dx), to_uint(box_z/target_dx)) : resolution(float3(box_x, box_y, box_z), memory);
-	if(target_dx>0.0f) lbm_N.y += (domains_y-lbm_N.y%domains_y)%domains_y;
+	const uint ny_multiple = (uint)env_u("VS_NY_MULTIPLE", (ulong)domains_y);
+	if(ny_multiple==0u||ny_multiple%domains_y) print_error("VS_NY_MULTIPLE must be a positive multiple of VS_DY.");
+	if(target_dx>0.0f) lbm_N.y += (ny_multiple-lbm_N.y%ny_multiple)%ny_multiple;
 	else lbm_N.y -= lbm_N.y%domains_y;
 	const float cells_per_m = (float)lbm_N.x/box_x;
 	const float lbm_length = si_length*cells_per_m;
@@ -147,7 +149,11 @@ void main_setup() {
 		setenv("VS_SL_DT0", "1.0", 1);
 	}
 	const bool render_only = env_u("VS_RENDER_ONLY", 0ull)!=0ull;
+#ifdef TEMPERATURE
+	LBM lbm(render_only ? uint3(8u, 8u, 8u) : lbm_N, 1u, render_only ? 1u : domains_y, 1u, lbm_nu, 0.0f, 0.0f, env_f("VS_HEAT_G", -2.0E-6f), 0.0f, env_f("VS_HEAT_ALPHA", 0.01f), env_f("VS_HEAT_BETA", 1.0f));
+#else // TEMPERATURE
 	LBM lbm(render_only ? uint3(8u, 8u, 8u) : lbm_N, 1u, render_only ? 1u : domains_y, 1u, lbm_nu);
+#endif // TEMPERATURE
 	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
 
 	const bool tilt_flow = env_u("VS_TILT", 1ull)!=0ull;
@@ -193,7 +199,32 @@ void main_setup() {
 			lbm.u.z[n] = lbm_u*wind_z;
 		}
 		if(x==0u||x==Nx-1u||y==0u||y==Ny-1u||z==0u||z==Nz-1u) lbm.flags[n] = TYPE_E;
+#ifdef TEMPERATURE
+		const bool heater = x>=Nx*3u/10u&&x<=Nx*7u/10u&&y>=Ny*45u/100u&&y<=Ny*55u/100u&&z>=Nz*85u/100u&&z<=Nz*90u/100u;
+		if(heater&&lbm.flags[n]==0u) {
+			lbm.flags[n] = TYPE_T;
+			lbm.T[n] = env_f("VS_HEAT_T", 1.5f);
+		}
+#endif // TEMPERATURE
 	});
+	const string rotor_stl = env_s("VS_ROTOR_STL", "");
+	Mesh* rotor = nullptr;
+	const float rotor_omega = env_f("VS_ROTOR_OMEGA", 0.0015f);
+	const float3 rotor_center = float3(env_f("VS_ROTOR_X", 0.5f)*(float)Nx, env_f("VS_ROTOR_Y", 0.5f)*(float)Ny, env_f("VS_ROTOR_Z", 0.8f)*(float)Nz);
+	const uchar rotor_flag = (uchar)(TYPE_S|TYPE_Y);
+	if(!rotor_stl.empty()) {
+#ifdef MOVING_BOUNDARIES
+		rotor = read_stl(rotor_stl, cells_per_m, float3x3(1.0f), float3(0.0f));
+		rotor->translate(rotor_center);
+		rotor->set_center(rotor_center);
+		rotor->find_bounds();
+		lbm.flags.write_to_device();
+		lbm.u.write_to_device();
+		lbm.voxelize_mesh_on_device(rotor, rotor_flag, rotor_center, float3(0.0f), float3(0.0f, 0.0f, rotor_omega));
+#else // MOVING_BOUNDARIES
+		print_error("VS_ROTOR_STL needs a MOVING_BOUNDARIES build.");
+#endif // MOVING_BOUNDARIES
+	}
 	vector<uchar> host_flags;
 	if(check_every) {
 		host_flags.resize((size_t)lbm.get_N());
@@ -232,14 +263,13 @@ void main_setup() {
 	};
 
 	create_folder(out);
-#ifdef FORCE_FIELD
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
 	const string log_path = out+"forces.csv";
 	FILE* force_log = fopen(log_path.c_str(), "w");
 	if(force_log==nullptr) print_error("Cannot open force log.");
 	fprintf(force_log, "t,si_time_s,Fx_N,Fy_drag_N,Fz_lift_N,CD_planform,CL_planform,Mroll_Nm,Mpitch_Nm,Myaw_Nm\n");
 	const float3 mrp_mesh = cells_per_m*(rotation*float3(env_f("VS_MRP_X", 0.0f), env_f("VS_MRP_Y", 0.0f), env_f("VS_MRP_Z", 0.0f)))+shift;
 	const float3 mrp_box = mrp_mesh+float3(0.5f-0.5f*(float)Nx, 0.5f-0.5f*(float)Ny, 0.5f-0.5f*(float)Nz);
-	if(lbm.get_D()>1u) print_warning("Moments are only valid for a single domain.");
 	print_info("planform "+to_string(si_planform, 2u)+" m2, frontal "+to_string(si_frontal, 2u)+" m2, moment reference box cells "+to_string(mrp_box.x, 1u)+" "+to_string(mrp_box.y, 1u)+" "+to_string(mrp_box.z, 1u));
 	const float q_ref = 0.5f*si_rho*sq(si_u)*si_planform;
 #endif
@@ -278,7 +308,7 @@ void main_setup() {
 			}
 			next_gpu_check = t+(t==0ull ? min(gpu_check_every, 5ull*frame_every) : gpu_check_every);
 		}
-#ifdef FORCE_FIELD
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
 		if(t%force_every==0ull) {
 			const float3 f = lbm.object_force((uchar)(TYPE_S|TYPE_X));
 			const float3 m = lbm.object_torque(mrp_box, (uchar)(TYPE_S|TYPE_X));
@@ -315,9 +345,18 @@ void main_setup() {
 			if(bad>0ull||sqrt(u_max)>0.5f) blown = true;
 		}
 		if(t>=lbm_T) break;
-		lbm.run(min(frame_every, lbm_T-t), lbm_T);
+		const ulong chunk = min(frame_every, lbm_T-t);
+#ifdef MOVING_BOUNDARIES
+		if(rotor!=nullptr) {
+			rotor->rotate(float3x3(float3(0.0f, 0.0f, 1.0f), rotor_omega*(float)chunk));
+			lbm.voxelize_mesh_on_device(rotor, rotor_flag, rotor_center, float3(0.0f), float3(0.0f, 0.0f, rotor_omega));
+		}
+#endif // MOVING_BOUNDARIES
+		lbm.run(chunk, lbm_T);
 	}
 	if(env_u("VS_HASH_FIELDS", 0ull)&&!blown) lbm.print_field_hashes();
+	const string dump_path = env_s("VS_DUMP_FIELDS", "");
+	if(!dump_path.empty()&&!blown) lbm.write_global_fields(dump_path);
 	if(!q_sweep.empty()&&!blown) {
 		const float q_keep = vs_q_runtime;
 		std::stringstream list(q_sweep);
@@ -328,7 +367,7 @@ void main_setup() {
 		}
 		vs_q_runtime = q_keep;
 	}
-#ifdef FORCE_FIELD
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
 	fclose(force_log);
 #endif
 	if(blown) println("\nBLOWUP detected, run stopped.");

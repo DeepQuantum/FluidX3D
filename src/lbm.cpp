@@ -95,9 +95,11 @@ string default_filename(const string& name, const string& extension, const ulong
 
 
 
-LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho, const cl::Buffer* fi_slot, fpxx* fi_host) { // constructor with manual device selection and domain offset
+LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho, const cl::Buffer* fi_slot, fpxx* fi_host, const cl::Buffer* gi_slot, fpxx* gi_host) { // constructor with manual device selection and domain offset
 	this->fi_slot = fi_slot;
 	this->fi_host = fi_host;
+	this->gi_slot = gi_slot;
+	this->gi_host = gi_host;
 	this->Nx = Nx; this->Ny = Ny; this->Nz = Nz;
 	this->Dx = Dx; this->Dy = Dy; this->Dz = Dz;
 	this->Ox = Ox; this->Oy = Oy; this->Oz = Oz;
@@ -129,18 +131,27 @@ void LBM_Domain::allocate(Device& device) {
 	rho = Memory<float>(device, N, 1u, true, true, 1.0f);
 	u = Memory<float>(device, N, 3u);
 	flags = Memory<uchar>(device, N);
+#ifdef GRAPHICS
+	u_ghost = Memory<float>(device, (ulong)Nx*(ulong)Nz, 3u);
+#endif // GRAPHICS
 	kernel_initialize = Kernel(device, N, "initialize", fi, rho, u, flags);
 	kernel_stream_collide = Kernel(device, N, "stream_collide", fi, rho, u, flags, t, fx, fy, fz);
 	kernel_update_fields = Kernel(device, N, "update_fields", fi, rho, u, flags, t, fx, fy, fz);
 
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
+	object_sum = Memory<float>(device, 1u, 4u); // x, y, z, cell count
+	kernel_object_center_of_mass = Kernel(device, N, "object_center_of_mass", flags, (uchar)0u, object_sum);
+#endif // FORCE_FIELD||FORCE_SUM
+#ifdef FORCE_SUM
+	object_partial = Memory<double>(device, (ulong)force_sum_groups, 6u);
+	kernel_object_force_torque = Kernel(device, (ulong)force_sum_groups*(ulong)WORKGROUP_SIZE, (uint)WORKGROUP_SIZE, "object_force_torque", fi, flags, t, (uchar)0u, object_partial);
+#endif // FORCE_SUM
 #ifdef FORCE_FIELD
 	F = Memory<float>(device, N, 3u);
-	object_sum = Memory<float>(device, 1u, 4u); // x, y, z, cell count
 	kernel_stream_collide.add_parameters(F);
 	kernel_update_fields.add_parameters(F);
 	kernel_update_force_field = Kernel(device, N, "update_force_field", fi, flags, t, F);
 	kernel_reset_force_field = Kernel(device, N, "reset_force_field", F);
-	kernel_object_center_of_mass = Kernel(device, N, "object_center_of_mass", flags, (uchar)0u, object_sum);
 	kernel_object_force = Kernel(device, N, "object_force", F, flags, (uchar)0u, object_sum);
 	kernel_object_torque = Kernel(device, N, "object_torque", F, flags, (uchar)0u, 0.0f, 0.0f, 0.0f, object_sum);
 #endif // FORCE_FIELD
@@ -162,7 +173,8 @@ void LBM_Domain::allocate(Device& device) {
 #endif // SURFACE
 
 #ifdef TEMPERATURE
-	gi = Memory<fpxx>(device, N, 7u, false);
+	if(gi_slot!=nullptr) gi = Memory<fpxx>(device, N, 7u, gi_host, *gi_slot);
+	else gi = Memory<fpxx>(device, N, 7u, false);
 	T = Memory<float>(device, N, 1u, true, true, 1.0f);
 	kernel_initialize.add_parameters(gi, T);
 	kernel_stream_collide.add_parameters(gi, T);
@@ -208,13 +220,13 @@ void LBM_Domain::enqueue_surface_3() {
 	kernel_surface_3.enqueue_run();
 }
 #endif // SURFACE
-#ifdef FORCE_FIELD
-void LBM_Domain::enqueue_update_force_field() { // calculate forces from fluid on TYPE_S cells
-	if(t!=t_last_force_field) { // only run kernel_update_force_field if the time step has changed since last update
-		kernel_update_force_field.set_parameters(2u, t).enqueue_run();
-		t_last_force_field = t;
-	}
+#ifdef FORCE_SUM
+void LBM_Domain::enqueue_object_force_torque(const uchar flag_marker) {
+	kernel_object_force_torque.set_parameters(2u, t, flag_marker).enqueue_run();
+	object_partial.enqueue_read_from_device();
 }
+#endif // FORCE_SUM
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
 void LBM_Domain::enqueue_object_center_of_mass(const uchar flag_marker) { // calculate center of mass of all cells flagged with flag_marker
 	object_sum.x[0] = 0.0f; // reset object_sum
 	object_sum.y[0] = 0.0f;
@@ -222,6 +234,14 @@ void LBM_Domain::enqueue_object_center_of_mass(const uchar flag_marker) { // cal
 	object_sum.enqueue_write_to_device();
 	kernel_object_center_of_mass.set_parameters(1u, flag_marker).enqueue_run();
 	object_sum.enqueue_read_from_device();
+}
+#endif // FORCE_FIELD||FORCE_SUM
+#ifdef FORCE_FIELD
+void LBM_Domain::enqueue_update_force_field() { // calculate forces from fluid on TYPE_S cells
+	if(t!=t_last_force_field) { // only run kernel_update_force_field if the time step has changed since last update
+		kernel_update_force_field.set_parameters(2u, t).enqueue_run();
+		t_last_force_field = t;
+	}
 }
 void LBM_Domain::enqueue_object_force(const uchar flag_marker) { // add up force for all cells flagged with flag_marker
 	enqueue_update_force_field(); // update force field if it is not yet up-to-date
@@ -277,6 +297,31 @@ uint LBM_Domain::get_velocity_set() const {
 	return velocity_set;
 }
 
+uint voxelize_direction(const Mesh* mesh, const float3& rotational_velocity) {
+	const float x0=mesh->pmin.x-2.0f, y0=mesh->pmin.y-2.0f, z0=mesh->pmin.z-2.0f, x1=mesh->pmax.x+2.0f, y1=mesh->pmax.y+2.0f, z1=mesh->pmax.z+2.0f;
+	uint direction = 0u;
+	if(length(rotational_velocity)==0.0f) { // choose direction of minimum bounding-box cross-section area
+		float v[3] = { (y1-y0)*(z1-z0), (z1-z0)*(x1-x0), (x1-x0)*(y1-y0) };
+		float vmin = v[0];
+		for(uint i=1u; i<3u; i++) {
+			if(v[i]<vmin) {
+				vmin = v[i];
+				direction = i;
+			}
+		}
+	} else { // choose direction closest to rotation axis
+		float v[3] = { fabsf(rotational_velocity.x), fabsf(rotational_velocity.y), fabsf(rotational_velocity.z) };
+		float vmax = v[0];
+		for(uint i=1u; i<3u; i++) {
+			if(v[i]>vmax) {
+				vmax = v[i];
+				direction = i; // find direction of minimum bounding-box cross-section area
+			}
+		}
+	}
+	return direction;
+}
+
 void LBM_Domain::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, const float3& rotation_center, const float3& linear_velocity, const float3& rotational_velocity) { // voxelize triangle mesh
 	Memory<float3> p0(device, mesh->triangle_number, 1u, mesh->p0);
 	Memory<float3> p1(device, mesh->triangle_number, 1u, mesh->p1);
@@ -299,26 +344,7 @@ void LBM_Domain::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, con
 	bounding_box_and_velocity[13] = rotational_velocity.x;
 	bounding_box_and_velocity[14] = rotational_velocity.y;
 	bounding_box_and_velocity[15] = rotational_velocity.z;
-	uint direction = 0u;
-	if(length(rotational_velocity)==0.0f) { // choose direction of minimum bounding-box cross-section area
-		float v[3] = { (y1-y0)*(z1-z0), (z1-z0)*(x1-x0), (x1-x0)*(y1-y0) };
-		float vmin = v[0];
-		for(uint i=1u; i<3u; i++) {
-			if(v[i]<vmin) {
-				vmin = v[i];
-				direction = i;
-			}
-		}
-	} else { // choose direction closest to rotation axis
-		float v[3] = { fabsf(rotational_velocity.x), fabsf(rotational_velocity.y), fabsf(rotational_velocity.z) };
-		float vmax = v[0];
-		for(uint i=1u; i<3u; i++) {
-			if(v[i]>vmax) {
-				vmax = v[i];
-				direction = i; // find direction of minimum bounding-box cross-section area
-			}
-		}
-	}
+	const uint direction = voxelize_direction(mesh, rotational_velocity);
 	const ulong A[3] = { (ulong)Ny*(ulong)Nz, (ulong)Nz*(ulong)Nx, (ulong)Nx*(ulong)Ny };
 	Kernel kernel_voxelize_mesh(device, A[direction], "voxelize_mesh", direction, fi, u, flags, t+1ull, flag, p0, p1, p2, bounding_box_and_velocity);
 #ifdef SURFACE
@@ -449,6 +475,10 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	"\n	#define FORCE_FIELD"
 #endif // FORCE_FIELD
 
+#ifdef FORCE_SUM
+	"\n	#define FORCE_SUM"
+#endif // FORCE_SUM
+
 #ifdef SURFACE
 	"\n	#define SURFACE"
 	"\n	#define def_6_sigma "+to_string(6.0f*sigma)+"f" // rho_laplace = 2*o*K, rho = 1-rho_laplace/c^2 = 1-(6*o)*K
@@ -527,7 +557,7 @@ void LBM_Domain::Graphics::allocate(Device& device) {
 		if(GRAPHICS_LSQ>0u&&!enable_ls) print_warning(device.info.name+" does not support local memory optimization with GRAPHICS_LSQ = "+to_string(GRAPHICS_LSQ)+" (max supported workgroup size: "+to_string(device.info.max_workgroup_size)+" (required: "+to_string(cb(GRAPHICS_LSQ))+"), cache: "+to_string(device.info.local_cache)+"KB (required: "+to_string(cache_required)+"KB)). Disabling local memory optimization.");
 		const ulong N = enable_ls ? (ulong)((lbm->get_Nx()+GRAPHICS_LSQ-2u)/GRAPHICS_LSQ)*(ulong)((lbm->get_Ny()+GRAPHICS_LSQ-2u)/GRAPHICS_LSQ)*(ulong)((lbm->get_Nz()+GRAPHICS_LSQ-2u)/GRAPHICS_LSQ)*(ulong)cb(GRAPHICS_LSQ) : (ulong)(lbm->get_Nx()-1u)*(ulong)(lbm->get_Ny()-1u)*(ulong)(lbm->get_Nz()-1u);
 		const uint workgroup_size = enable_ls ? cb(GRAPHICS_LSQ) : WORKGROUP_SIZE;
-		kernel_graphics_q = Kernel(device, N, workgroup_size, "graphics_q", camera_parameters, bitmap, zbuffer, 0, 0.0f, lbm->rho, lbm->u);
+		kernel_graphics_q = Kernel(device, N, workgroup_size, "graphics_q", camera_parameters, bitmap, zbuffer, 0, 0.0f, lbm->rho, lbm->u, lbm->u_ghost);
 	}
 
 #ifdef FORCE_FIELD
@@ -784,7 +814,8 @@ LBM::LBM(const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint 
 	for(uint d=0u; d<D; d++) { // parallel_for((ulong)D, D, [&](ulong d) {
 		const uint x=((uint)d%(Dx*Dy))%Dx, y=((uint)d%(Dx*Dy))/Dx, z=(uint)d/(Dx*Dy); // d = x+(y+z*Dy)*Dx
 		const bool swapped = ooc.active&&ooc.slot_of[d]>=0;
-		lbm_domain[d] = new LBM_Domain(device_infos[d], this->Nx/Dx+2u*Hx, this->Ny/Dy+2u*Hy, this->Nz/Dz+2u*Hz, Dx, Dy, Dz, (int)(x*this->Nx/Dx)-(int)Hx, (int)(y*this->Ny/Dy)-(int)Hy, (int)(z*this->Nz/Dz)-(int)Hz, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho, swapped ? &ooc.slot_fi[(uint)ooc.slot_of[d]] : nullptr, swapped ? ooc.host_fi[d] : nullptr);
+		const bool swapped_gi = swapped&&!ooc.slot_gi.empty();
+		lbm_domain[d] = new LBM_Domain(device_infos[d], this->Nx/Dx+2u*Hx, this->Ny/Dy+2u*Hy, this->Nz/Dz+2u*Hz, Dx, Dy, Dz, (int)(x*this->Nx/Dx)-(int)Hx, (int)(y*this->Ny/Dy)-(int)Hy, (int)(z*this->Nz/Dz)-(int)Hz, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho, swapped ? &ooc.slot_fi[(uint)ooc.slot_of[d]] : nullptr, swapped ? ooc.host_fi[d] : nullptr, swapped_gi ? &ooc.slot_gi[(uint)ooc.slot_of[d]] : nullptr, swapped_gi ? (fpxx*)((char*)ooc.host_fi[d]+ooc.fi_bytes) : nullptr);
 	} // });
 	{
 		Memory<float>** buffers_rho = new Memory<float>*[D];
@@ -833,7 +864,9 @@ LBM::~LBM() {
 	if(ooc.active) ooc_finish();
 	for(uint d=0u; d<get_D(); d++) delete lbm_domain[d];
 	delete[] lbm_domain;
+	ooc.slot_gi.clear();
 	ooc.slot_fi.clear();
+	ooc.slot_mem.clear();
 	ooc.pinned_handles.clear();
 	for(void* block : ooc.pinned_blocks) std::free(block);
 	ooc.pinned_blocks.clear();
@@ -941,6 +974,9 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 #ifndef BENCHMARK
 	sanity_checks_initialization();
 #endif // BENCHMARK
+#ifdef FORCE_SUM
+	object_sums_invalidate();
+#endif // FORCE_SUM
 
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->rho.enqueue_write_to_device();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->u.enqueue_write_to_device();
@@ -980,6 +1016,9 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 		ooc.pending_rho_u_flags = false;
 		for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_init, 0u, nullptr);
 		communicate_rho_u_flags();
+#ifdef TEMPERATURE
+		communicate_T();
+#endif // TEMPERATURE
 		ooc.pending_fi = true;
 		ooc.pending_t = lbm_domain[0]->get_t();
 		ooc.pending_generation = 0u;
@@ -1075,9 +1114,41 @@ void LBM::reset() { // reset simulation (takes effect in following run() call)
 
 #ifdef FORCE_FIELD
 void LBM::update_force_field() { // calculate forces from fluid on TYPE_S cells
+	if(ooc.active) {
+		for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_work, 0u, [](LBM_Domain& domain) { domain.enqueue_update_force_field(); });
+		ooc_finish();
+		return;
+	}
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_update_force_field();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
 }
+#endif // FORCE_FIELD
+#ifdef FORCE_SUM
+void LBM::object_force_torque(const uchar flag_marker) {
+	const ulong t = get_t();
+	if(object_sums.t==t&&object_sums.flag==flag_marker) return;
+	const auto work = [flag_marker](LBM_Domain& domain) { domain.enqueue_object_force_torque(flag_marker); };
+	if(ooc.active) {
+		for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_work, 0u, work);
+		ooc_finish();
+	} else {
+		for(uint d=0u; d<get_D(); d++) work(*lbm_domain[d]);
+		for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	}
+	double sum[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+	for(uint d=0u; d<get_D(); d++) {
+		const double* partial = lbm_domain[d]->object_partial.data();
+		for(ulong g=0ull; g<(ulong)force_sum_groups; g++) for(uint k=0u; k<6u; k++) sum[k] += partial[6ull*g+(ulong)k];
+	}
+	for(uint k=0u; k<3u; k++) {
+		object_sums.F[k] = sum[k];
+		object_sums.M[k] = sum[3u+k];
+	}
+	object_sums.t = t;
+	object_sums.flag = flag_marker;
+}
+#endif // FORCE_SUM
+#if defined(FORCE_FIELD)||defined(FORCE_SUM)
 float3 LBM::object_center_of_mass(const uchar flag_marker) { // calculate center of mass of all cells flagged with flag_marker
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_object_center_of_mass(flag_marker);
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
@@ -1090,23 +1161,56 @@ float3 LBM::object_center_of_mass(const uchar flag_marker) { // calculate center
 	return object_com/(float)object_cells;
 }
 float3 LBM::object_force(const uchar flag_marker) { // add up force for all cells flagged with flag_marker
-	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_object_force(flag_marker);
-	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+#ifdef FORCE_SUM
+	object_force_torque(flag_marker);
+	return float3((float)object_sums.F[0], (float)object_sums.F[1], (float)object_sums.F[2]);
+#else // FORCE_SUM
+	bool current = true;
+	for(uint d=0u; d<get_D(); d++) current = current&&lbm_domain[d]->force_field_current();
+	if(ooc.active&&!current) {
+		for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_work, 0u, [flag_marker](LBM_Domain& domain) { domain.enqueue_object_force(flag_marker); });
+		ooc_finish();
+	} else {
+		for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_object_force(flag_marker);
+		for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	}
 	float3 object_force = float3(0.0f, 0.0f, 0.0f);
 	for(uint d=0u; d<get_D(); d++) object_force += float3(lbm_domain[d]->object_sum.x[0], lbm_domain[d]->object_sum.y[0], lbm_domain[d]->object_sum.z[0]);
 	return object_force;
+#endif // FORCE_SUM
 }
 float3 LBM::object_torque(const float3& rotation_center, const uchar flag_marker) { // add up torque around specified rotation center for all cells flagged with flag_marker
-	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_object_torque(rotation_center, flag_marker);
-	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+#ifdef FORCE_SUM
+	object_force_torque(flag_marker);
+	const double* F = object_sums.F;
+	const double cx=(double)rotation_center.x, cy=(double)rotation_center.y, cz=(double)rotation_center.z;
+	return float3((float)(object_sums.M[0]-(cy*F[2]-cz*F[1])), (float)(object_sums.M[1]-(cz*F[0]-cx*F[2])), (float)(object_sums.M[2]-(cx*F[1]-cy*F[0])));
+#else // FORCE_SUM
+	bool current = true;
+	for(uint d=0u; d<get_D(); d++) current = current&&lbm_domain[d]->force_field_current();
+	if(ooc.active&&!current) {
+		for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_work, 0u, [&rotation_center, flag_marker](LBM_Domain& domain) { domain.enqueue_object_torque(rotation_center, flag_marker); });
+		ooc_finish();
+	} else {
+		for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_object_torque(rotation_center, flag_marker);
+		for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	}
 	float3 object_torque = float3(0.0f, 0.0f, 0.0f);
 	for(uint d=0u; d<get_D(); d++) object_torque += float3(lbm_domain[d]->object_sum.x[0], lbm_domain[d]->object_sum.y[0], lbm_domain[d]->object_sum.z[0]);
 	return object_torque;
+#endif // FORCE_SUM
 }
-#endif // FORCE_FIELD
+#endif // FORCE_FIELD||FORCE_SUM
 
 #ifdef MOVING_BOUNDARIES
 void LBM::update_moving_boundaries() { // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
+	if(ooc.active) ooc_modify_domains(true, 0.0f, 0.0f, nullptr);
+	enqueue_moving_boundaries_and_flags();
+}
+void LBM::enqueue_moving_boundaries_and_flags() {
+#ifdef FORCE_SUM
+	object_sums_invalidate();
+#endif // FORCE_SUM
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_update_moving_boundaries();
 	communicate_flags();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
@@ -1161,9 +1265,24 @@ void LBM::write_status(const string& path) { // write LBM status report to a .tx
 	write_file(filename, status);
 }
 
+void LBM::ooc_modify_domains(const bool all, const float y0, const float y1, const std::function<void(LBM_Domain&)>& work) {
+	for(uint d=0u; d<get_D(); d++) {
+		const LBM_Domain& domain = *lbm_domain[d];
+		const float first=(float)domain.Oy, last=(float)(domain.Oy+(int)domain.Ny-1);
+		if(all||(last>=y0&&first<=y1)) ooc_visit(d, ooc_modify, 0u, work);
+	}
+	ooc_finish();
+}
+
 void LBM::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, const float3& rotation_center, const float3& linear_velocity, const float3& rotational_velocity) { // voxelize triangle mesh
-	if(ooc.active) print_error("Device mesh voxelization is not available in out-of-core mode.");
-	if(get_D()==1u) {
+#ifdef FORCE_SUM
+	object_sums_invalidate();
+#endif // FORCE_SUM
+	if(ooc.active) {
+		ooc_modify_domains(voxelize_direction(mesh, rotational_velocity)==1u, mesh->pmin.y-2.0f, mesh->pmax.y+2.0f, [&](LBM_Domain& domain) {
+			domain.voxelize_mesh_on_device(mesh, flag, rotation_center, linear_velocity, rotational_velocity);
+		});
+	} else if(get_D()==1u) {
 		lbm_domain[0]->voxelize_mesh_on_device(mesh, flag, rotation_center, linear_velocity, rotational_velocity); // if this crashes on Windows, create a TdrDelay 32-bit DWORD with decimal value 300 in Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers
 	} else {
 		parallel_for(get_D(), get_D(), [&](uint d) {
@@ -1171,7 +1290,7 @@ void LBM::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, const floa
 		});
 	}
 #ifdef MOVING_BOUNDARIES
-	if((flag&(TYPE_S|TYPE_E))==TYPE_S&&(length(linear_velocity)>0.0f||length(rotational_velocity)>0.0f)) update_moving_boundaries();
+	if((flag&(TYPE_S|TYPE_E))==TYPE_S&&(length(linear_velocity)>0.0f||length(rotational_velocity)>0.0f)) enqueue_moving_boundaries_and_flags();
 #endif // MOVING_BOUNDARIES
 	if(!initialized) {
 		flags.read_from_device();
@@ -1179,6 +1298,13 @@ void LBM::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, const floa
 	}
 }
 void LBM::unvoxelize_mesh_on_device(const Mesh* mesh, const uchar flag) { // remove voxelized triangle mesh from LBM grid by removing all flags in mesh bounding box (only required when bounding box size changes during re-voxelization)
+#ifdef FORCE_SUM
+	object_sums_invalidate();
+#endif // FORCE_SUM
+	if(ooc.active) {
+		ooc_modify_domains(false, mesh->pmin.y-1.0f, mesh->pmax.y+1.0f, [&](LBM_Domain& domain) { domain.enqueue_unvoxelize_mesh_on_device(mesh, flag); });
+		return;
+	}
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_unvoxelize_mesh_on_device(mesh, flag);
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
 }
@@ -1239,10 +1365,22 @@ void LBM::voxelize_stl(const string& path, const float size, const uchar flag) {
 int* LBM::Graphics::draw_frame() {
 	const bool fields_needed = (bool)(visualization_modes&(VIS_FIELD|VIS_STREAMLINES|VIS_Q_CRITERION));
 #ifndef UPDATE_FIELDS
-	if(fields_needed&&!lbm->ooc.active) {
-		for(uint d=0u; d<lbm->get_D(); d++) lbm->lbm_domain[d]->enqueue_update_fields(); // only call update_fields() if the time step has changed since the last rendered frame
+	if(fields_needed) {
+		if(lbm->ooc.active) {
+			for(uint d=0u; d<lbm->get_D(); d++) lbm->ooc_visit(d, ooc_work, 0u, [](LBM_Domain& domain) { domain.enqueue_update_fields(); });
+			lbm->ooc_finish();
+		} else {
+			for(uint d=0u; d<lbm->get_D(); d++) lbm->lbm_domain[d]->enqueue_update_fields(); // only call update_fields() if the time step has changed since the last rendered frame
+		}
+		if(lbm->get_D()>1u) {
+			lbm->communicate_rho_u_flags();
+#ifdef TEMPERATURE
+			lbm->communicate_T();
+#endif // TEMPERATURE
+		}
 	}
 #endif // UPDATE_FIELDS
+	if(lbm->get_Dy()>1u&&(visualization_modes&VIS_Q_CRITERION)) lbm->fill_u_ghost();
 	if(key_1) { visualization_modes = (visualization_modes&~0b11)|(((visualization_modes&0b11)+1)%4); key_1 = false; }
 	if(key_2) { visualization_modes ^= VIS_FIELD        ; key_2 = false; }
 	if(key_3) { visualization_modes ^= VIS_STREAMLINES  ; key_3 = false; }
@@ -1281,20 +1419,8 @@ int* LBM::Graphics::draw_frame() {
 	last_slice_y = slice_y;
 	last_slice_z = slice_z;
 	bool new_frame = true;
-	if(lbm->ooc.active) {
-		for(uint d=0u; d<lbm->get_D(); d++) {
-			lbm->ooc_visit(d, ooc_work, 0u, [&](LBM_Domain& domain) {
-#ifndef UPDATE_FIELDS
-				if(fields_needed) domain.enqueue_update_fields();
-#endif // UPDATE_FIELDS
-				new_frame = new_frame && domain.graphics.enqueue_draw_frame(visualization_modes, field_mode, slice_mode, slice_x, slice_y, slice_z, visualization_change);
-			});
-		}
-		lbm->ooc_finish();
-	} else {
 	for(uint d=0u; d<lbm->get_D(); d++) new_frame = new_frame && lbm->lbm_domain[d]->graphics.enqueue_draw_frame(visualization_modes, field_mode, slice_mode, slice_x, slice_y, slice_z, visualization_change);
 	for(uint d=0u; d<lbm->get_D(); d++) lbm->lbm_domain[d]->finish_queue();
-	}
 	int* bitmap = lbm->lbm_domain[0]->graphics.get_bitmap();
 	int* zbuffer = lbm->lbm_domain[0]->graphics.get_zbuffer();
 	for(uint d=1u; d<lbm->get_D()&&new_frame; d++) {
@@ -1589,12 +1715,28 @@ void LBM::ooc_plan(const vector<Device_Info>& device_infos) {
 	const ulong local_Nx=(ulong)(Nx/Dx+2u*(Dx>1u)), local_Ny=(ulong)(Ny/Dy+2u*(Dy>1u)), local_Nz=(ulong)(Nz/Dz+2u*(Dz>1u));
 	const ulong local_N = local_Nx*local_Ny*local_Nz;
 	const ulong area = local_Nz*local_Nx;
-	const ulong fi_bytes = local_N*(ulong)velocity_set*(ulong)sizeof(fpxx);
+	ulong fi_bytes = local_N*(ulong)velocity_set*(ulong)sizeof(fpxx);
+	ulong gi_bytes = 0ull;
+#ifdef TEMPERATURE
+	gi_bytes = local_N*7ull*(ulong)sizeof(fpxx);
+	const ulong base_align = std::max<ulong>((ulong)device_infos[0].cl_device.getInfo<CL_DEVICE_MEM_BASE_ADDR_ALIGN>()/8ull, 4096ull);
+	fi_bytes = ((fi_bytes+base_align-1ull)/base_align)*base_align;
+#endif // TEMPERATURE
+	const ulong swap_bytes = fi_bytes+gi_bytes;
 	ulong frame_bytes = 0ull;
 #ifdef GRAPHICS
 	frame_bytes = 3ull*(ulong)camera.width*(ulong)camera.height*4ull;
 #endif // GRAPHICS
-	const ulong rest_bytes = local_N*(ulong)(bytes_per_cell_device()-velocity_set*(uint)sizeof(fpxx))+frame_bytes+2ull*area*(ulong)max(transfers*(uint)sizeof(fpxx), 17u);
+	ulong rest_bytes = local_N*(ulong)(bytes_per_cell_device()-velocity_set*(uint)sizeof(fpxx))+frame_bytes+2ull*area*(ulong)max(transfers*(uint)sizeof(fpxx), 17u);
+#ifdef TEMPERATURE
+	rest_bytes -= gi_bytes;
+#endif // TEMPERATURE
+#ifdef FORCE_SUM
+	rest_bytes += 48ull*(ulong)force_sum_groups;
+#endif // FORCE_SUM
+#ifdef GRAPHICS
+	rest_bytes += 12ull*area;
+#endif // GRAPHICS
 	const ulong overhead_bytes = (ulong)vs_env_uint("VS_VRAM_OVERHEAD_MB", 400u)*1048576ull;
 	uint slots = max(vs_env_uint("VS_OOC_SLOTS", 2u), 1u);
 	uint resident = D;
@@ -1603,8 +1745,8 @@ void LBM::ooc_plan(const vector<Device_Info>& device_infos) {
 	} else {
 		const ulong budget = (ulong)budget_mb*1048576ull;
 		const ulong fixed = (ulong)D*rest_bytes+overhead_bytes;
-		if(fixed+(ulong)D*fi_bytes>budget) {
-			const ulong fi_buffers = budget>fixed ? (budget-fixed)/fi_bytes : 0ull;
+		if(fixed+(ulong)D*swap_bytes>budget) {
+			const ulong fi_buffers = budget>fixed ? (budget-fixed)/swap_bytes : 0ull;
 			if(fi_buffers<=(ulong)slots) print_error("VS_VRAM_MB="+to_string(budget_mb)+" is too small for out-of-core execution with "+to_string(slots)+" slots.");
 			resident = (uint)min(fi_buffers-(ulong)slots, (ulong)D);
 		}
@@ -1615,9 +1757,12 @@ void LBM::ooc_plan(const vector<Device_Info>& device_infos) {
 	}
 	slots = min(slots, D-resident);
 	if(Dx!=1u||Dz!=1u) print_error("Out-of-core execution supports domains along y only.");
-#if defined(FORCE_FIELD)||defined(SURFACE)||defined(TEMPERATURE)||defined(PARTICLES)||defined(MOVING_BOUNDARIES)
-	print_error("Out-of-core execution supports the plain fluid solver only.");
-#endif // FORCE_FIELD||SURFACE||TEMPERATURE||PARTICLES||MOVING_BOUNDARIES
+#ifdef SURFACE
+	print_error("Out-of-core execution does not support SURFACE.");
+#endif // SURFACE
+#ifdef PARTICLES
+	print_error("Out-of-core execution does not support PARTICLES.");
+#endif // PARTICLES
 	for(uint d=0u; d<D; d++) {
 		if(device_infos[d].uses_ram) print_error("Out-of-core execution needs a GPU with its own memory.");
 		if(device_infos[d].cl_device()!=device_infos[0].cl_device()||device_infos[d].cl_context()!=device_infos[0].cl_context()) print_error("Out-of-core execution supports a single GPU only.");
@@ -1626,6 +1771,7 @@ void LBM::ooc_plan(const vector<Device_Info>& device_infos) {
 	ooc.resident = resident;
 	ooc.slots = slots;
 	ooc.fi_bytes = fi_bytes;
+	ooc.swap_bytes = swap_bytes;
 	const cl::Context& context = device_infos[0].cl_context;
 	int error = 0;
 	ooc.queue_up = cl::CommandQueue(context, device_infos[0].cl_device, 0, &error);
@@ -1633,19 +1779,33 @@ void LBM::ooc_plan(const vector<Device_Info>& device_infos) {
 	ooc.queue_down = cl::CommandQueue(context, device_infos[0].cl_device, 0, &error);
 	ooc_check(error, "download queue creation");
 	for(uint s=0u; s<slots; s++) {
-		ooc.slot_fi.emplace_back(context, CL_MEM_READ_WRITE, fi_bytes, nullptr, &error);
+		ooc.slot_mem.emplace_back(context, CL_MEM_READ_WRITE, swap_bytes, nullptr, &error);
 		ooc_check(error, "slot allocation");
+		if(gi_bytes==0ull) {
+			ooc.slot_fi.push_back(ooc.slot_mem[s]);
+		} else {
+			const cl_buffer_region fi_region = { 0u, (size_t)fi_bytes }, gi_region = { (size_t)fi_bytes, (size_t)gi_bytes };
+			ooc.slot_fi.push_back(ooc.slot_mem[s].createSubBuffer(CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &fi_region, &error));
+			ooc_check(error, "slot sub-buffer");
+			ooc.slot_gi.push_back(ooc.slot_mem[s].createSubBuffer(CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &gi_region, &error));
+			ooc_check(error, "slot sub-buffer");
+		}
 	}
 	ooc.slot_of.assign(D, -1);
 	ooc.host_fi.assign(D, nullptr);
 	for(uint d=resident; d<D; d++) {
 		ooc.slot_of[d] = (int)((d-resident)%slots);
-		ooc.host_fi[d] = (fpxx*)ooc_pinned(context, fi_bytes);
+		ooc.host_fi[d] = (fpxx*)ooc_pinned(context, swap_bytes);
 	}
 	ooc.stage_bytes[0] = ((area*17ull+4095ull)/4096ull)*4096ull;
 	ooc.stage_bytes[1] = ((area*(ulong)transfers*(ulong)sizeof(fpxx)+4095ull)/4096ull)*4096ull;
-	char* block = (char*)ooc_pinned(context, 4ull*(ulong)D*(ooc.stage_bytes[0]+ooc.stage_bytes[1]));
-	for(uint f=0u; f<2u; f++) for(uint g=0u; g<2u; g++) for(uint side=0u; side<2u; side++) {
+#ifdef TEMPERATURE
+	ooc.stage_bytes[2] = ((area*4ull+4095ull)/4096ull)*4096ull;
+	ooc.stage_bytes[3] = ((area*(ulong)sizeof(fpxx)+4095ull)/4096ull)*4096ull;
+#endif // TEMPERATURE
+	const ulong stage_total = ooc.stage_bytes[0]+ooc.stage_bytes[1]+ooc.stage_bytes[2]+ooc.stage_bytes[3];
+	char* block = (char*)ooc_pinned(context, 4ull*(ulong)D*stage_total);
+	for(uint f=0u; f<4u; f++) for(uint g=0u; g<2u; g++) for(uint side=0u; side<2u; side++) {
 		ooc.stage[f][g][side].assign(D, nullptr);
 		for(uint d=0u; d<D; d++) {
 			ooc.stage[f][g][side][d] = block;
@@ -1653,11 +1813,12 @@ void LBM::ooc_plan(const vector<Device_Info>& device_infos) {
 		}
 	}
 	ooc.slot_free.assign(slots, cl::Event());
+	ooc.keep_halo.assign(D, 0);
 	ooc.host_fi_ready.assign(D, cl::Event());
 	for(uint g=0u; g<2u; g++) ooc.extract_done[g].assign(D, cl::Event());
-	const ulong device_bytes = (ulong)D*rest_bytes+(ulong)(resident+slots)*fi_bytes+overhead_bytes;
-	const ulong host_bytes = (ulong)(D-resident)*fi_bytes+4ull*(ulong)D*(ooc.stage_bytes[0]+ooc.stage_bytes[1]);
-	print_info("Out-of-core: "+to_string(D)+" domains, "+to_string(resident)+" resident, "+to_string(D-resident)+" swapped through "+to_string(slots)+" slots; DDFs "+to_string((ulong)(fi_bytes/1048576ull))+" MB per domain; device estimate "+to_string((ulong)(device_bytes/1048576ull))+" MB; pinned host "+to_string((ulong)(host_bytes/1048576ull))+" MB.");
+	const ulong device_bytes = (ulong)D*rest_bytes+(ulong)(resident+slots)*swap_bytes+overhead_bytes;
+	const ulong host_bytes = (ulong)(D-resident)*swap_bytes+4ull*(ulong)D*stage_total;
+	print_info("Out-of-core: "+to_string(D)+" domains, "+to_string(resident)+" resident, "+to_string(D-resident)+" swapped through "+to_string(slots)+" slots; DDFs "+to_string((ulong)(swap_bytes/1048576ull))+" MB per domain; device estimate "+to_string((ulong)(device_bytes/1048576ull))+" MB; pinned host "+to_string((ulong)(host_bytes/1048576ull))+" MB.");
 }
 
 void LBM::ooc_visit(const uint d, const ooc_visit_kind kind, const uint generation, const std::function<void(LBM_Domain&)>& work) {
@@ -1675,12 +1836,12 @@ void LBM::ooc_visit(const uint d, const ooc_visit_kind kind, const uint generati
 		} else {
 			if(ooc.host_fi_ready[d]()) before_upload.push_back(ooc.host_fi_ready[d]);
 			cl::Event uploaded;
-			ooc_check(ooc.queue_up.enqueueWriteBuffer(ooc.slot_fi[(uint)slot], CL_FALSE, 0ull, ooc.fi_bytes, ooc.host_fi[d], before_upload.empty() ? nullptr : &before_upload, &uploaded), "upload");
+			ooc_check(ooc.queue_up.enqueueWriteBuffer(ooc.slot_mem[(uint)slot], CL_FALSE, 0ull, ooc.swap_bytes, ooc.host_fi[d], before_upload.empty() ? nullptr : &before_upload, &uploaded), "upload");
 			wait.push_back(uploaded);
-			ooc.uploaded += ooc.fi_bytes;
+			ooc.uploaded += ooc.swap_bytes;
 		}
 	}
-	const bool insert = kind!=ooc_init&&ooc.pending_fi;
+	const bool insert = kind!=ooc_init&&ooc.pending_fi&&!ooc.keep_halo[d];
 	const uint pending = ooc.pending_generation;
 	if(insert) {
 		if(ooc.extract_done[pending][dyp]()) wait.push_back(ooc.extract_done[pending][dyp]);
@@ -1688,19 +1849,38 @@ void LBM::ooc_visit(const uint d, const ooc_visit_kind kind, const uint generati
 	}
 	if(!wait.empty()) ooc_check(queue.enqueueBarrierWithWaitList(&wait), "barrier");
 	if(insert) {
-		if(ooc.pending_rho_u_flags) domain.enqueue_transfer_insert_host(domain.kernel_transfer[enum_transfer_field::rho_u_flags][1], 1u, 17u, ooc.pending_t, ooc.stage[0][pending][1][dyp], ooc.stage[0][pending][0][dym]);
+		if(ooc.pending_rho_u_flags) {
+			domain.enqueue_transfer_insert_host(domain.kernel_transfer[enum_transfer_field::rho_u_flags][1], 1u, 17u, ooc.pending_t, ooc.stage[0][pending][1][dyp], ooc.stage[0][pending][0][dym]);
+#ifdef TEMPERATURE
+			domain.enqueue_transfer_insert_host(domain.kernel_transfer[enum_transfer_field::T][1], 1u, 4u, ooc.pending_t, ooc.stage[2][pending][1][dyp], ooc.stage[2][pending][0][dym]);
+#endif // TEMPERATURE
+		}
 		domain.enqueue_transfer_insert_host(domain.kernel_transfer[enum_transfer_field::fi][1], 1u, fi_cell_bytes, ooc.pending_t, ooc.stage[1][pending][1][dyp], ooc.stage[1][pending][0][dym]);
+#ifdef TEMPERATURE
+		domain.enqueue_transfer_insert_host(domain.kernel_transfer[enum_transfer_field::gi][1], 1u, (uint)sizeof(fpxx), ooc.pending_t, ooc.stage[3][pending][1][dyp], ooc.stage[3][pending][0][dym]);
+#endif // TEMPERATURE
 	}
 	if(kind==ooc_step) {
 		domain.enqueue_stream_collide();
 		domain.enqueue_transfer_extract_host(domain.kernel_transfer[enum_transfer_field::rho_u_flags][0], 1u, 17u, domain.get_t(), ooc.stage[0][generation][0][d], ooc.stage[0][generation][1][d]);
+#ifdef TEMPERATURE
+		domain.enqueue_transfer_extract_host(domain.kernel_transfer[enum_transfer_field::T][0], 1u, 4u, domain.get_t(), ooc.stage[2][generation][0][d], ooc.stage[2][generation][1][d]);
+#endif // TEMPERATURE
 	}
 	if(kind==ooc_init) domain.enqueue_initialize();
-	if(kind!=ooc_work) domain.enqueue_transfer_extract_host(domain.kernel_transfer[enum_transfer_field::fi][0], 1u, fi_cell_bytes, domain.get_t(), ooc.stage[1][generation][0][d], ooc.stage[1][generation][1][d]);
+	const bool extract = kind==ooc_step||kind==ooc_init;
+	if(extract) {
+		domain.enqueue_transfer_extract_host(domain.kernel_transfer[enum_transfer_field::fi][0], 1u, fi_cell_bytes, domain.get_t(), ooc.stage[1][generation][0][d], ooc.stage[1][generation][1][d]);
+#ifdef TEMPERATURE
+		domain.enqueue_transfer_extract_host(domain.kernel_transfer[enum_transfer_field::gi][0], 1u, (uint)sizeof(fpxx), domain.get_t(), ooc.stage[3][generation][0][d], ooc.stage[3][generation][1][d]);
+#endif // TEMPERATURE
+	}
 	if(work) work(domain);
 	cl::Event done;
 	ooc_check(queue.enqueueMarkerWithWaitList(nullptr, &done), "marker");
-	if(kind!=ooc_work) ooc.extract_done[generation][d] = done;
+	if(extract) ooc.extract_done[generation][d] = done;
+	if(kind==ooc_step||kind==ooc_init) ooc.keep_halo[d] = 0;
+	if(kind==ooc_modify) ooc.keep_halo[d] = 1;
 	vector<cl::Event>& window = ooc.in_flight[ooc.pass%2ull];
 	window.push_back(done);
 	if(slot>=0) {
@@ -1709,8 +1889,8 @@ void LBM::ooc_visit(const uint d, const ooc_visit_kind kind, const uint generati
 		} else {
 			vector<cl::Event> after(1, done);
 			cl::Event downloaded;
-			ooc_check(ooc.queue_down.enqueueReadBuffer(ooc.slot_fi[(uint)slot], CL_FALSE, 0ull, ooc.fi_bytes, ooc.host_fi[d], &after, &downloaded), "download");
-			ooc.downloaded += ooc.fi_bytes;
+			ooc_check(ooc.queue_down.enqueueReadBuffer(ooc.slot_mem[(uint)slot], CL_FALSE, 0ull, ooc.swap_bytes, ooc.host_fi[d], &after, &downloaded), "download");
+			ooc.downloaded += ooc.swap_bytes;
 			ooc.host_fi_ready[d] = downloaded;
 			ooc.slot_free[(uint)slot] = downloaded;
 			window.push_back(downloaded);
@@ -1741,6 +1921,103 @@ void LBM::ooc_finish() {
 	ooc_check(ooc.queue_down.finish(), "download queue finish");
 	ooc.in_flight[0].clear();
 	ooc.in_flight[1].clear();
+}
+
+#ifdef GRAPHICS
+void LBM::fill_u_ghost() {
+	for(uint d=0u; d<get_D(); d++) {
+		const uint x=(d%(Dx*Dy))%Dx, y=(d%(Dx*Dy))/Dx, z=d/(Dx*Dy), dyp=x+(((y+1u)%Dy)+z*Dy)*Dx;
+		LBM_Domain& source = *lbm_domain[dyp];
+		LBM_Domain& target = *lbm_domain[d];
+		const size_t lx=(size_t)source.get_Nx(), ly=(size_t)source.get_Ny(), lz=(size_t)source.get_Nz();
+		cl::CommandQueue queue = source.get_device().get_cl_queue();
+		for(size_t c=0u; c<3u; c++) {
+			ooc_check(queue.enqueueReadBufferRect(source.u.get_cl_buffer(), CL_FALSE, {0u, 2u, c*lz}, {0u, 0u, c*lz}, {lx*4u, 1u, lz}, lx*4u, lx*ly*4u, lx*4u, lx*4u, target.u_ghost.data()), "ghost read");
+		}
+	}
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->u_ghost.enqueue_write_to_device();
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+}
+#endif // GRAPHICS
+
+void LBM::write_global_fields(const string& path) {
+	update_fields();
+	const ulong N = get_N();
+	const auto mix = [](ulong h) {
+		h ^= h>>30; h *= 0xBF58476D1CE4E5B9ull;
+		h ^= h>>27; h *= 0x94D049BB133111EBull;
+		return h^(h>>31);
+	};
+	ulong fi_sum = 0ull, cells = 0ull;
+	for(uint d=0u; d<get_D(); d++) {
+		LBM_Domain& domain = *lbm_domain[d];
+		const ulong local_N = domain.get_N();
+		vector<float> rho_h(local_N), u_h(3ull*local_N);
+		vector<fpxx> fi_h(local_N*(ulong)velocity_set);
+#ifdef TEMPERATURE
+		vector<fpxx> gi_h(local_N*7ull);
+		vector<float> T_h(local_N);
+#endif // TEMPERATURE
+		const auto read = [&](LBM_Domain& source) {
+			cl::CommandQueue queue = source.get_device().get_cl_queue();
+#ifdef TEMPERATURE
+			ooc_check(queue.enqueueReadBuffer(source.gi.get_cl_buffer(), CL_FALSE, 0ull, local_N*7ull*sizeof(fpxx), gi_h.data()), "dump read");
+			ooc_check(queue.enqueueReadBuffer(source.T.get_cl_buffer(), CL_FALSE, 0ull, local_N*4ull, T_h.data()), "dump read");
+#endif // TEMPERATURE
+			ooc_check(queue.enqueueReadBuffer(source.rho.get_cl_buffer(), CL_FALSE, 0ull, local_N*4ull, rho_h.data()), "dump read");
+			ooc_check(queue.enqueueReadBuffer(source.u.get_cl_buffer(), CL_FALSE, 0ull, 3ull*local_N*4ull, u_h.data()), "dump read");
+			ooc_check(queue.enqueueReadBuffer(source.fi.get_cl_buffer(), CL_FALSE, 0ull, local_N*(ulong)velocity_set*sizeof(fpxx), fi_h.data()), "dump read");
+		};
+		if(ooc.active) {
+			ooc_visit(d, ooc_work, 0u, read);
+			ooc_finish();
+		} else {
+			read(domain);
+			domain.finish_queue();
+		}
+		const ulong lx=(ulong)domain.get_Nx(), ly=(ulong)domain.get_Ny(), lz=(ulong)domain.get_Nz();
+		const ulong hx=(ulong)(Dx>1u), hy=(ulong)(Dy>1u), hz=(ulong)(Dz>1u);
+		for(ulong n=0ull; n<local_N; n++) {
+			const ulong x=n%lx, y=(n/lx)%ly, z=n/(lx*ly);
+			if(x<hx||x+hx>=lx||y<hy||y+hy>=ly||z<hz||z+hz>=lz) continue;
+			const ulong gx=(ulong)((long)x+(long)domain.Ox), gy=(ulong)((long)y+(long)domain.Oy), gz=(ulong)((long)z+(long)domain.Oz);
+			const ulong g = gx+(gy+gz*(ulong)Ny)*(ulong)Nx;
+			ulong h = mix(g+0x9E3779B97F4A7C15ull);
+			for(uint i=0u; i<velocity_set; i++) {
+				ulong v = 0ull;
+				std::memcpy(&v, &fi_h[(ulong)i*local_N+n], sizeof(fpxx));
+				h = mix(h^(v+(ulong)i*0x100000001B3ull));
+			}
+#ifdef TEMPERATURE
+			for(uint i=0u; i<7u; i++) {
+				ulong v = 0ull;
+				std::memcpy(&v, &gi_h[(ulong)i*local_N+n], sizeof(fpxx));
+				h = mix(h^(v+(ulong)(i+64u)*0x100000001B3ull));
+			}
+			{
+				uint v = 0u;
+				std::memcpy(&v, &T_h[n], 4u);
+				h = mix(h^((ulong)v+0x5555ull));
+			}
+#endif // TEMPERATURE
+			fi_sum += h;
+			cells++;
+		}
+		if(domain.rho.data()==nullptr||domain.u.data()==nullptr) print_error("Field dump needs the host rho/u copies.");
+		std::memcpy(domain.rho.data(), rho_h.data(), local_N*4ull);
+		std::memcpy(domain.u.data(), u_h.data(), 3ull*local_N*4ull);
+	}
+	FILE* file = fopen(path.c_str(), "wb");
+	if(file==nullptr) print_error("Cannot open "+path+".");
+	vector<float> slab((size_t)N);
+	for(uint c=0u; c<4u; c++) {
+		for(ulong n=0ull; n<N; n++) slab[(size_t)n] = c==0u ? rho[n] : c==1u ? u.x[n] : c==2u ? u.y[n] : u.z[n];
+		fwrite(slab.data(), sizeof(float), (size_t)N, file);
+	}
+	fclose(file);
+	fprintf(stdout, "global fields %llu cells, fi interior checksum %016llx over %llu cells, rho/u written to %s\n", (unsigned long long)N, (unsigned long long)fi_sum, (unsigned long long)cells, path.c_str());
+	fflush(stdout);
 }
 
 void LBM::print_field_hashes() {
