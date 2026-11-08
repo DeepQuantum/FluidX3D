@@ -1,3 +1,12 @@
+> [!IMPORTANT]
+> **This is an altered version of FluidX3D**, maintained for the Voidstar spaceplane airflow work. It is not the original software, which is [ProjectPhysX/FluidX3D](https://github.com/ProjectPhysX/FluidX3D) by Dr. Moritz Lehmann, under the licence in [LICENSE.md](LICENSE.md) (non-commercial, non-military). Changes against upstream:
+> - Out-of-core execution for grids larger than VRAM: DDFs of some domains live in pinned host memory and stream through device slots each step (`VS_VRAM_MB`, `VS_OOC_RESIDENT`, `VS_OOC_SLOTS`).
+> - Flow-over-hull opacity composite that is correct with several domains.
+> - A ship-airflow `setup.cpp` driven by `VS_*` environment variables, and `make_voidstar.sh` for Linux builds.
+> - Plain-text logs when stdout is not a terminal.
+>
+> Built and tested on Linux with NVIDIA OpenCL only. The Windows build files are kept from upstream but are not maintained here.
+
 # FluidX3D
 
 The fastest and most memory efficient lattice Boltzmann CFD software, running on all GPUs and CPUs via [OpenCL](https://github.com/ProjectPhysX/OpenCL-Wrapper "OpenCL-Wrapper"). Free for non-commercial use.
