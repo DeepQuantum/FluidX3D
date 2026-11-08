@@ -5,6 +5,7 @@
 #include "graphics.hpp"
 #include "units.hpp"
 #include "info.hpp"
+#include <functional>
 
 uint bytes_per_cell_host(); // returns the number of Bytes per cell allocated in host memory
 uint bytes_per_cell_device(); // returns the number of Bytes per cell allocated in device memory
@@ -18,6 +19,7 @@ string default_filename(const string& name, const string& extension, const ulong
 enum enum_transfer_field { fi, rho_u_flags, flags, F, phi_massex_flags, gi, T, enum_transfer_field_length };
 
 class LBM_Domain {
+	friend class LBM;
 private:
 	uint Nx=1u, Ny=1u, Nz=1u; // (local) lattice dimensions
 	uint Dx=1u, Dy=1u, Dz=1u; // lattice domains
@@ -63,6 +65,9 @@ private:
 	Kernel kernel_integrate_particles; // intgegrates particles forward in time and couples particles to fluid
 #endif // PARTICLES
 
+	const cl::Buffer* fi_slot = nullptr;
+	fpxx* fi_host = nullptr;
+
 	void allocate(Device& device); // allocate all memory for data fields on host and device and set up kernels
 	string device_defines(const Device_Info& device_info) const; // returns preprocessor constants for embedding in OpenCL C code
 
@@ -90,8 +95,10 @@ public:
 	ulong get_area(const uint direction);
 	void enqueue_transfer_extract_field(Kernel& kernel_transfer_extract_field, const uint direction, const uint bytes_per_cell);
 	void enqueue_transfer_insert_field(Kernel& kernel_transfer_insert_field, const uint direction, const uint bytes_per_cell);
+	void enqueue_transfer_extract_host(Kernel& kernel_transfer_extract_field, const uint direction, const uint bytes_per_cell, const ulong t, void* host_p, void* host_m);
+	void enqueue_transfer_insert_host(Kernel& kernel_transfer_insert_field, const uint direction, const uint bytes_per_cell, const ulong t, const void* host_p, const void* host_m);
 
-	LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho); // compiles OpenCL C code and allocates memory
+	LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho, const cl::Buffer* fi_slot=nullptr, fpxx* fi_host=nullptr); // compiles OpenCL C code and allocates memory
 
 	void enqueue_initialize(); // write all data fields to device and call kernel_initialize
 	void enqueue_stream_collide(); // call kernel_stream_collide to perform one LBM time step
@@ -120,6 +127,8 @@ public:
 	void finish_queue();
 
 	const Device& get_device() const { return device; }
+	struct sampled_state_result { float rho_min, rho_max, speed_max; uint bad; };
+	sampled_state_result sampled_state();
 	uint get_Nx() const { return Nx; } // get (local) lattice dimensions in x-direction
 	uint get_Ny() const { return Ny; } // get (local) lattice dimensions in y-direction
 	uint get_Nz() const { return Nz; } // get (local) lattice dimensions in z-direction
@@ -152,6 +161,9 @@ public:
 		Kernel kernel_clear; // reset bitmap and zbuffer
 		Memory<int> bitmap; // bitmap for rendering
 		Memory<int> zbuffer; // z-buffer for rendering
+		Memory<int> hull_bitmap;
+		Kernel kernel_snapshot_hull, kernel_composite_flow;
+		float flow_opacity = 1.0f;
 		Memory<float> camera_parameters; // contains camera position, rotation, field of view etc.
 
 		LBM_Domain* lbm = nullptr;
@@ -161,6 +173,9 @@ public:
 		Kernel kernel_graphics_field_slice; // render one slice of velocity field according to slics settings
 		Kernel kernel_graphics_streamline; // render streamlines
 		Kernel kernel_graphics_q; // render vorticity (Q-criterion)
+		Kernel kernel_graphics_mesh;
+		Memory<float> mesh_p;
+		ulong mesh_triangles = 0ull;
 
 #ifdef SURFACE
 		const string path_skybox = get_exe_path()+"../skybox/skybox8k.png";
@@ -194,6 +209,7 @@ public:
 			return *this;
 		}
 		void allocate(Device& device); // allocate memory for bitmap and zbuffer
+		void set_mesh(const Mesh* mesh, const float3& origin);
 		bool enqueue_draw_frame(const int visualization_modes, const int field_mode=0, const int slice_mode=0, const int slice_x=0, const int slice_y=0, const int slice_z=0, const bool visualization_change=true); // main rendering function, calls rendering kernels, returns true if new frame is rendered, false if old frame is returned when camera has not moved
 		int* get_bitmap(); // returns pointer to bitmap
 		int* get_zbuffer(); // returns pointer to zbuffer
@@ -217,6 +233,30 @@ private:
 	void do_time_step(); // call kernel_stream_collide to perform one LBM time step
 
 	void communicate_field(const enum_transfer_field field, const uint bytes_per_cell);
+
+	enum ooc_visit_kind { ooc_step, ooc_work, ooc_init };
+	struct Out_Of_Core {
+		bool active = false;
+		uint resident = 0u, slots = 0u;
+		ulong fi_bytes = 0ull, stage_bytes[2] = { 0ull, 0ull };
+		vector<int> slot_of;
+		vector<cl::Buffer> slot_fi;
+		vector<cl::Buffer> pinned_handles;
+		vector<void*> pinned_blocks;
+		vector<fpxx*> host_fi;
+		vector<char*> stage[2][2][2];
+		cl::CommandQueue queue_up, queue_down;
+		vector<cl::Event> slot_free, host_fi_ready, extract_done[2], in_flight[2];
+		bool pending_fi = false, pending_rho_u_flags = false;
+		ulong pending_t = 0ull;
+		uint pending_generation = 0u;
+		ulong pass = 0ull, uploaded = 0ull, downloaded = 0ull;
+	} ooc;
+	void ooc_plan(const vector<Device_Info>& device_infos);
+	void* ooc_pinned(const cl::Context& context, const ulong bytes);
+	void ooc_visit(const uint d, const ooc_visit_kind kind, const uint generation, const std::function<void(LBM_Domain&)>& work);
+	void ooc_time_step();
+	void ooc_finish();
 
 	void communicate_fi();
 	void communicate_rho_u_flags();
@@ -389,7 +429,8 @@ public:
 		inline const T operator()(const ulong i, const uint dimension) const { return reference(i, dimension); } // array of structures
 		inline void read_from_device() {
 #ifndef UPDATE_FIELDS
-			if(lbm->initialized) for(uint domain=0u; domain<D; domain++) lbm->lbm_domain[domain]->enqueue_update_fields(); // only if simulation has already been initialized: make sure data in device memory is up-to-date
+			if(lbm->initialized&&lbm->out_of_core()) lbm->update_fields();
+			else if(lbm->initialized) for(uint domain=0u; domain<D; domain++) lbm->lbm_domain[domain]->enqueue_update_fields(); // only if simulation has already been initialized: make sure data in device memory is up-to-date
 #endif // UPDATE_FIELDS
 			for(uint domain=0u; domain<D; domain++) buffers[domain]->enqueue_read_from_device();
 			for(uint domain=0u; domain<D; domain++) buffers[domain]->finish_queue();
@@ -438,6 +479,10 @@ public:
 	void run(const ulong steps=max_ulong, const ulong total_steps=max_ulong); // initializes the LBM simulation (copies data to device and runs initialize kernel), then runs LBM
 	void update_fields(); // update fields (rho, u, T) manually
 	void reset(); // reset simulation (takes effect in following run() call)
+	bool out_of_core() const { return ooc.active; }
+	ulong out_of_core_uploaded() const { return ooc.uploaded; }
+	ulong out_of_core_downloaded() const { return ooc.downloaded; }
+	void print_field_hashes();
 #ifdef FORCE_FIELD
 	void update_force_field(); // calculate forces from fluid on TYPE_S cells
 	float3 object_center_of_mass(const uchar flag_marker=TYPE_S); // calculate center of mass of all cells flagged with flag_marker
@@ -593,6 +638,7 @@ public:
 
 		int* draw_frame(); // main rendering function, calls rendering kernels
 
+		void set_mesh(const Mesh* mesh);
 		void set_camera_centered(const float rx=0.0f, const float ry=0.0f, const float fov=100.0f, const float zoom=1.0f); // set camera centered
 		void set_camera_free(const float3& p=float3(0.0f), const float rx=0.0f, const float ry=0.0f, const float fov=100.0f); // set camera free
 		bool next_frame(const ulong total_time_steps, const float video_length_seconds); // returns true once simulation time has progressed enough to render the next video frame for a 60fps video of specified length

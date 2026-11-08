@@ -1,4 +1,6 @@
 #include "lbm.hpp"
+#include <cstdlib>
+#include <cstring>
 
 
 
@@ -93,7 +95,9 @@ string default_filename(const string& name, const string& extension, const ulong
 
 
 
-LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho) { // constructor with manual device selection and domain offset
+LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho, const cl::Buffer* fi_slot, fpxx* fi_host) { // constructor with manual device selection and domain offset
+	this->fi_slot = fi_slot;
+	this->fi_host = fi_host;
 	this->Nx = Nx; this->Ny = Ny; this->Nz = Nz;
 	this->Dx = Dx; this->Dy = Dy; this->Dz = Dz;
 	this->Ox = Ox; this->Oy = Oy; this->Oz = Oz;
@@ -120,7 +124,8 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 
 void LBM_Domain::allocate(Device& device) {
 	const ulong N = get_N();
-	fi = Memory<fpxx>(device, N, velocity_set, false);
+	if(fi_slot!=nullptr) fi = Memory<fpxx>(device, N, velocity_set, fi_host, *fi_slot);
+	else fi = Memory<fpxx>(device, N, velocity_set, false);
 	rho = Memory<float>(device, N, 1u, true, true, 1.0f);
 	u = Memory<float>(device, N, 3u);
 	flags = Memory<uchar>(device, N);
@@ -468,11 +473,34 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 ;}
 
 #ifdef GRAPHICS
+LBM_Domain::sampled_state_result LBM_Domain::sampled_state() {
+	const uint samples = 4096u;
+	Memory<float> values(device, 4u*samples);
+	Kernel sample(device, samples, "sample_state", rho, u, flags, values, samples);
+	sample.enqueue_run();
+	values.read_from_device();
+	float r_min=2.0f, r_max=0.0f, u2_max=0.0f;
+	uint bad=0u;
+	for(uint i=0u; i<samples; i++) {
+		const float r=values[4u*i], ux=values[4u*i+1u], uy=values[4u*i+2u], uz=values[4u*i+3u];
+		const float u2=ux*ux+uy*uy+uz*uz;
+		if(!std::isfinite(r)||!std::isfinite(u2)||r<=0.0f) { bad++; continue; }
+		r_min=fmin(r_min, r); r_max=fmax(r_max, r); u2_max=fmax(u2_max, u2);
+	}
+	return { r_min, r_max, std::sqrt(u2_max), bad };
+}
+
 void LBM_Domain::Graphics::allocate(Device& device) {
 	bitmap = Memory<int>(device, camera.width*camera.height);
 	zbuffer = Memory<int>(device, camera.width*camera.height, 1u, lbm->get_D()>1u); // if there are multiple domains, allocate zbuffer also on host side
 	camera_parameters = Memory<float>(device, 15u);
 	kernel_clear = Kernel(device, bitmap.length(), "graphics_clear", bitmap, zbuffer);
+	flow_opacity = clamp(vs_env_float("VS_FLOW_OPACITY", 1.0f), 0.0f, 1.0f);
+	if(flow_opacity<1.0f) {
+		hull_bitmap = Memory<int>(device, bitmap.length(), 1u, false, true);
+		kernel_snapshot_hull = Kernel(device, bitmap.length(), "graphics_snapshot_hull", bitmap, hull_bitmap);
+		kernel_composite_flow = Kernel(device, bitmap.length(), "graphics_composite_flow", bitmap, hull_bitmap, flow_opacity);
+	}
 	kernel_graphics_flags = Kernel(device, lbm->get_N(), "graphics_flags", camera_parameters, bitmap, zbuffer, lbm->flags);
 	{
 #ifndef FORCE_FIELD
@@ -499,7 +527,7 @@ void LBM_Domain::Graphics::allocate(Device& device) {
 		if(GRAPHICS_LSQ>0u&&!enable_ls) print_warning(device.info.name+" does not support local memory optimization with GRAPHICS_LSQ = "+to_string(GRAPHICS_LSQ)+" (max supported workgroup size: "+to_string(device.info.max_workgroup_size)+" (required: "+to_string(cb(GRAPHICS_LSQ))+"), cache: "+to_string(device.info.local_cache)+"KB (required: "+to_string(cache_required)+"KB)). Disabling local memory optimization.");
 		const ulong N = enable_ls ? (ulong)((lbm->get_Nx()+GRAPHICS_LSQ-2u)/GRAPHICS_LSQ)*(ulong)((lbm->get_Ny()+GRAPHICS_LSQ-2u)/GRAPHICS_LSQ)*(ulong)((lbm->get_Nz()+GRAPHICS_LSQ-2u)/GRAPHICS_LSQ)*(ulong)cb(GRAPHICS_LSQ) : (ulong)(lbm->get_Nx()-1u)*(ulong)(lbm->get_Ny()-1u)*(ulong)(lbm->get_Nz()-1u);
 		const uint workgroup_size = enable_ls ? cb(GRAPHICS_LSQ) : WORKGROUP_SIZE;
-		kernel_graphics_q = Kernel(device, N, workgroup_size, "graphics_q", camera_parameters, bitmap, zbuffer, 0, lbm->rho, lbm->u);
+		kernel_graphics_q = Kernel(device, N, workgroup_size, "graphics_q", camera_parameters, bitmap, zbuffer, 0, 0.0f, lbm->rho, lbm->u);
 	}
 
 #ifdef FORCE_FIELD
@@ -543,6 +571,19 @@ bool LBM_Domain::Graphics::update_camera() {
 	}
 	return change; // return false if camera parameters remain unchanged
 }
+void LBM_Domain::Graphics::set_mesh(const Mesh* mesh, const float3& origin) {
+	mesh_triangles = (ulong)mesh->triangle_number;
+	mesh_p = Memory<float>(lbm->device, 9ull*mesh_triangles);
+	for(ulong i=0ull; i<mesh_triangles; i++) {
+		const float3 a=mesh->p0[i]-origin, b=mesh->p1[i]-origin, c=mesh->p2[i]-origin;
+		mesh_p[9ull*i   ]=a.x; mesh_p[9ull*i+1ull]=a.y; mesh_p[9ull*i+2ull]=a.z;
+		mesh_p[9ull*i+3ull]=b.x; mesh_p[9ull*i+4ull]=b.y; mesh_p[9ull*i+5ull]=b.z;
+		mesh_p[9ull*i+6ull]=c.x; mesh_p[9ull*i+7ull]=c.y; mesh_p[9ull*i+8ull]=c.z;
+	}
+	mesh_p.write_to_device();
+	if(vs_env_uint("VS_DROP_HOST_FIELDS", 0u)) mesh_p.delete_host_buffer();
+	kernel_graphics_mesh = Kernel(lbm->device, mesh_triangles, "graphics_mesh", camera_parameters, bitmap, zbuffer, mesh_p);
+}
 bool LBM_Domain::Graphics::enqueue_draw_frame(const int visualization_modes, const int field_mode, const int slice_mode, const int slice_x, const int slice_y, const int slice_z, const bool visualization_change) {
 	const bool camera_update = update_camera();
 #if defined(INTERACTIVE_GRAPHICS)||defined(INTERACTIVE_GRAPHICS_ASCII)
@@ -559,7 +600,11 @@ bool LBM_Domain::Graphics::enqueue_draw_frame(const int visualization_modes, con
 	if(visualization_modes&VIS_FLAG_LATTICE) kernel_graphics_flags.enqueue_run();
 	if(visualization_modes&VIS_FLAG_SURFACE) kernel_graphics_flags_mc.enqueue_run();
 	if(visualization_modes&VIS_STREAMLINES) kernel_graphics_streamline.set_parameters(3u, field_mode, slice_mode, sx, sy, sz).enqueue_run();
-	if(visualization_modes&VIS_Q_CRITERION) kernel_graphics_q.set_parameters(3u, field_mode).enqueue_run();
+	if((visualization_modes&VIS_MESH)&&mesh_triangles>0ull) kernel_graphics_mesh.enqueue_run();
+	const bool composite_flow = flow_opacity<1.0f&&(visualization_modes&VIS_MESH)&&(visualization_modes&VIS_Q_CRITERION)&&mesh_triangles>0ull;
+	if(composite_flow) kernel_snapshot_hull.enqueue_run();
+	if(visualization_modes&VIS_Q_CRITERION) kernel_graphics_q.set_parameters(3u, field_mode, vs_q_runtime).enqueue_run();
+	if(composite_flow) kernel_composite_flow.enqueue_run();
 #ifdef PARTICLES
 	if(visualization_modes&VIS_PARTICLES) kernel_graphics_particles.enqueue_run();
 #endif // PARTICLES
@@ -610,6 +655,11 @@ string LBM_Domain::Graphics::device_defines(const Device_Info& device_info) cons
 	"\n	#define def_scale_rho "        +to_string(0.5f/(GRAPHICS_RHO_DELTA))+"f"
 	"\n	#define def_scale_T "          +to_string(0.5f/(GRAPHICS_T_DELTA))+"f"
 	"\n	#define def_scale_F "          +to_string(0.5f/(GRAPHICS_F_MAX))+"f"
+	"\n	#define def_hull_color "       +to_string(vs_env_uint("VS_HULL", 0xC4C8CCu))+""
+	"\n	#define def_streamline_dt0 "   +to_string(vs_env_float("VS_SL_DT0", -1.0f))+"f"
+	"\n	#define def_rake_x "           +to_string(vs_env_float("VS_RAKE_XC", 1.0E7f))+"f"
+	"\n	#define def_rake_z0 "          +to_string(vs_env_float("VS_RAKE_Z0C", -1.0E7f))+"f"
+	"\n	#define def_rake_z1 "          +to_string(vs_env_float("VS_RAKE_Z1C", 1.0E7f))+"f"
 	"\n	#define def_scale_Q_min "      +to_string(GRAPHICS_Q_CRITERION)+"f"
 	"\n	#define def_streamline_sparse "+to_string(GRAPHICS_STREAMLINE_SPARSE)+"u"
 	"\n	#define def_streamline_length "+to_string(GRAPHICS_STREAMLINE_LENGTH)+"u"
@@ -727,10 +777,12 @@ LBM::LBM(const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint 
 	const uint Hx=Dx>1u, Hy=Dy>1u, Hz=Dz>1u; // halo offsets
 	const vector<Device_Info>& device_infos = smart_device_selection(D);
 	sanity_checks_constructor(device_infos, this->Nx, this->Ny, this->Nz, Dx, Dy, Dz, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho);
+	ooc_plan(device_infos);
 	lbm_domain = new LBM_Domain*[D];
 	for(uint d=0u; d<D; d++) { // parallel_for((ulong)D, D, [&](ulong d) {
 		const uint x=((uint)d%(Dx*Dy))%Dx, y=((uint)d%(Dx*Dy))/Dx, z=(uint)d/(Dx*Dy); // d = x+(y+z*Dy)*Dx
-		lbm_domain[d] = new LBM_Domain(device_infos[d], this->Nx/Dx+2u*Hx, this->Ny/Dy+2u*Hy, this->Nz/Dz+2u*Hz, Dx, Dy, Dz, (int)(x*this->Nx/Dx)-(int)Hx, (int)(y*this->Ny/Dy)-(int)Hy, (int)(z*this->Nz/Dz)-(int)Hz, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho);
+		const bool swapped = ooc.active&&ooc.slot_of[d]>=0;
+		lbm_domain[d] = new LBM_Domain(device_infos[d], this->Nx/Dx+2u*Hx, this->Ny/Dy+2u*Hy, this->Nz/Dz+2u*Hz, Dx, Dy, Dz, (int)(x*this->Nx/Dx)-(int)Hx, (int)(y*this->Ny/Dy)-(int)Hy, (int)(z*this->Nz/Dz)-(int)Hz, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho, swapped ? &ooc.slot_fi[(uint)ooc.slot_of[d]] : nullptr, swapped ? ooc.host_fi[d] : nullptr);
 	} // });
 	{
 		Memory<float>** buffers_rho = new Memory<float>*[D];
@@ -776,8 +828,13 @@ LBM::~LBM() {
 	camera.allow_rendering = false;
 #endif // GRAPHICS
 	info.print_finalize();
+	if(ooc.active) ooc_finish();
 	for(uint d=0u; d<get_D(); d++) delete lbm_domain[d];
 	delete[] lbm_domain;
+	ooc.slot_fi.clear();
+	ooc.pinned_handles.clear();
+	for(void* block : ooc.pinned_blocks) std::free(block);
+	ooc.pinned_blocks.clear();
 }
 
 void LBM::sanity_checks_constructor(const vector<Device_Info>& device_infos, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho) { // sanity checks on grid resolution and extension support
@@ -902,10 +959,30 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 #endif // PARTICLES
 
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->increment_time_step(); // the communicate calls at initialization need an odd time step
+	if(vs_env_uint("VS_DROP_HOST_FIELDS", 0u)) {
+		for(uint d=0u; d<get_D(); d++) {
+			if(lbm_domain[d]->get_device().info.uses_ram) print_error("Host-field release requires separate GPU device buffers.");
+			lbm_domain[d]->finish_queue();
+			lbm_domain[d]->rho.delete_host_buffer();
+			lbm_domain[d]->u.delete_host_buffer();
+			lbm_domain[d]->flags.delete_host_buffer();
+		}
+		print_info("Released host rho/u/flags copies; simulation fields remain on GPU.");
+	}
 	communicate_rho_u_flags();
 #ifdef SURFACE
 	communicate_phi_massex_flags();
 #endif // SURFACE
+	if(ooc.active) {
+		ooc.pending_fi = false;
+		ooc.pending_rho_u_flags = false;
+		for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_init, 0u, nullptr);
+		communicate_rho_u_flags();
+		ooc.pending_fi = true;
+		ooc.pending_t = lbm_domain[0]->get_t();
+		ooc.pending_generation = 0u;
+		ooc_finish();
+	} else {
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_initialize(); // odd time step is baked-in the kernel
 	communicate_rho_u_flags();
 #ifdef SURFACE
@@ -917,11 +994,16 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 	communicate_gi(); // time step must be odd here
 #endif // TEMPERATURE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	}
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->reset_time_step(); // set time step to 0 again
 	initialized = true;
 }
 
 void LBM::do_time_step() { // call kernel_stream_collide to perform one LBM time step
+	if(ooc.active) {
+		ooc_time_step();
+		return;
+	}
 #ifdef SURFACE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_surface_0();
 #endif // SURFACE
@@ -971,10 +1053,16 @@ void LBM::run(const ulong steps, const ulong total_steps) { // initializes the L
 		do_time_step();
 		info.update(clock.stop());
 	}
-	if(get_D()>1u) for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue(); // wait for everything to finish (multi-GPU only)
+	if(ooc.active) ooc_finish();
+	else if(get_D()>1u) for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue(); // wait for everything to finish (multi-GPU only)
 }
 
 void LBM::update_fields() { // update fields (rho, u, T) manually
+	if(ooc.active) {
+		for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_work, 0u, [](LBM_Domain& domain) { domain.enqueue_update_fields(); });
+		ooc_finish();
+		return;
+	}
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_update_fields();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
 }
@@ -1072,6 +1160,7 @@ void LBM::write_status(const string& path) { // write LBM status report to a .tx
 }
 
 void LBM::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, const float3& rotation_center, const float3& linear_velocity, const float3& rotational_velocity) { // voxelize triangle mesh
+	if(ooc.active) print_error("Device mesh voxelization is not available in out-of-core mode.");
 	if(get_D()==1u) {
 		lbm_domain[0]->voxelize_mesh_on_device(mesh, flag, rotation_center, linear_velocity, rotational_velocity); // if this crashes on Windows, create a TdrDelay 32-bit DWORD with decimal value 300 in Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers
 	} else {
@@ -1146,8 +1235,9 @@ void LBM::voxelize_stl(const string& path, const float size, const uchar flag) {
 
 #ifdef GRAPHICS
 int* LBM::Graphics::draw_frame() {
+	const bool fields_needed = (bool)(visualization_modes&(VIS_FIELD|VIS_STREAMLINES|VIS_Q_CRITERION));
 #ifndef UPDATE_FIELDS
-	if(visualization_modes&(VIS_FIELD|VIS_STREAMLINES|VIS_Q_CRITERION)) {
+	if(fields_needed&&!lbm->ooc.active) {
 		for(uint d=0u; d<lbm->get_D(); d++) lbm->lbm_domain[d]->enqueue_update_fields(); // only call update_fields() if the time step has changed since the last rendered frame
 	}
 #endif // UPDATE_FIELDS
@@ -1189,8 +1279,20 @@ int* LBM::Graphics::draw_frame() {
 	last_slice_y = slice_y;
 	last_slice_z = slice_z;
 	bool new_frame = true;
+	if(lbm->ooc.active) {
+		for(uint d=0u; d<lbm->get_D(); d++) {
+			lbm->ooc_visit(d, ooc_work, 0u, [&](LBM_Domain& domain) {
+#ifndef UPDATE_FIELDS
+				if(fields_needed) domain.enqueue_update_fields();
+#endif // UPDATE_FIELDS
+				new_frame = new_frame && domain.graphics.enqueue_draw_frame(visualization_modes, field_mode, slice_mode, slice_x, slice_y, slice_z, visualization_change);
+			});
+		}
+		lbm->ooc_finish();
+	} else {
 	for(uint d=0u; d<lbm->get_D(); d++) new_frame = new_frame && lbm->lbm_domain[d]->graphics.enqueue_draw_frame(visualization_modes, field_mode, slice_mode, slice_x, slice_y, slice_z, visualization_change);
 	for(uint d=0u; d<lbm->get_D(); d++) lbm->lbm_domain[d]->finish_queue();
+	}
 	int* bitmap = lbm->lbm_domain[0]->graphics.get_bitmap();
 	int* zbuffer = lbm->lbm_domain[0]->graphics.get_zbuffer();
 	for(uint d=1u; d<lbm->get_D()&&new_frame; d++) {
@@ -1212,6 +1314,9 @@ int* LBM::Graphics::draw_frame() {
 	return bitmap;
 }
 
+void LBM::Graphics::set_mesh(const Mesh* mesh) {
+	lbm->lbm_domain[0]->graphics.set_mesh(mesh, lbm->center());
+}
 void LBM::Graphics::set_camera_centered(const float rx, const float ry, const float fov, const float zoom) {
 	camera.free = false;
 	camera.rx = 0.5*pi+((double)rx*pi/180.0);
@@ -1435,3 +1540,241 @@ void LBM::communicate_particles() {
 	}
 }
 #endif // PARTICLES
+
+static void ooc_check(const int error, const string& what) {
+	if(error!=CL_SUCCESS) print_error("Out-of-core "+what+" failed with OpenCL error "+to_string(error)+".");
+}
+
+void LBM_Domain::enqueue_transfer_extract_host(Kernel& kernel_transfer_extract_field, const uint direction, const uint bytes_per_cell, const ulong t, void* host_p, void* host_m) {
+	kernel_transfer_extract_field.set_ranges(get_area(direction));
+	kernel_transfer_extract_field.set_parameters(0u, direction, t).enqueue_run();
+	const ulong bytes = kernel_transfer_extract_field.range()*(ulong)bytes_per_cell;
+	cl::CommandQueue queue = device.get_cl_queue();
+	ooc_check(queue.enqueueReadBuffer(transfer_buffer_p.get_cl_buffer(), CL_FALSE, 0ull, bytes, host_p), "halo read");
+	ooc_check(queue.enqueueReadBuffer(transfer_buffer_m.get_cl_buffer(), CL_FALSE, 0ull, bytes, host_m), "halo read");
+}
+void LBM_Domain::enqueue_transfer_insert_host(Kernel& kernel_transfer_insert_field, const uint direction, const uint bytes_per_cell, const ulong t, const void* host_p, const void* host_m) {
+	kernel_transfer_insert_field.set_ranges(get_area(direction));
+	const ulong bytes = kernel_transfer_insert_field.range()*(ulong)bytes_per_cell;
+	cl::CommandQueue queue = device.get_cl_queue();
+	ooc_check(queue.enqueueWriteBuffer(transfer_buffer_p.get_cl_buffer(), CL_FALSE, 0ull, bytes, host_p), "halo write");
+	ooc_check(queue.enqueueWriteBuffer(transfer_buffer_m.get_cl_buffer(), CL_FALSE, 0ull, bytes, host_m), "halo write");
+	kernel_transfer_insert_field.set_parameters(0u, direction, t).enqueue_run();
+}
+
+void* LBM::ooc_pinned(const cl::Context& context, const ulong bytes) {
+	const ulong size = ((max(bytes, (ulong)1u)+4095ull)/4096ull)*4096ull;
+	void* block = std::aligned_alloc(4096u, size);
+	if(block==nullptr) print_error("Out-of-core host allocation of "+to_string((ulong)(size/1048576ull))+" MB failed.");
+	std::memset(block, 0, size);
+	int error = 0;
+	ooc.pinned_handles.emplace_back(context, CL_MEM_READ_WRITE|CL_MEM_USE_HOST_PTR, size, block, &error);
+	ooc_check(error, "host pinning");
+	ooc.pinned_blocks.push_back(block);
+	return block;
+}
+
+void LBM::ooc_plan(const vector<Device_Info>& device_infos) {
+	const uint D = get_D();
+	const char* forced = std::getenv("VS_OOC_RESIDENT");
+	const uint budget_mb = vs_env_uint("VS_VRAM_MB", 0u);
+	if(D<2u||(forced==nullptr&&budget_mb==0u)) return;
+	const ulong local_Nx=(ulong)(Nx/Dx+2u*(Dx>1u)), local_Ny=(ulong)(Ny/Dy+2u*(Dy>1u)), local_Nz=(ulong)(Nz/Dz+2u*(Dz>1u));
+	const ulong local_N = local_Nx*local_Ny*local_Nz;
+	const ulong area = local_Nz*local_Nx;
+	const ulong fi_bytes = local_N*(ulong)velocity_set*(ulong)sizeof(fpxx);
+	ulong frame_bytes = 0ull;
+#ifdef GRAPHICS
+	frame_bytes = 3ull*(ulong)camera.width*(ulong)camera.height*4ull;
+#endif // GRAPHICS
+	const ulong rest_bytes = local_N*(ulong)(bytes_per_cell_device()-velocity_set*(uint)sizeof(fpxx))+frame_bytes+2ull*area*(ulong)max(transfers*(uint)sizeof(fpxx), 17u);
+	const ulong overhead_bytes = (ulong)vs_env_uint("VS_VRAM_OVERHEAD_MB", 400u)*1048576ull;
+	uint slots = max(vs_env_uint("VS_OOC_SLOTS", 2u), 1u);
+	uint resident = D;
+	if(forced!=nullptr) {
+		resident = min((uint)max(std::atoi(forced), 0), D);
+	} else {
+		const ulong budget = (ulong)budget_mb*1048576ull;
+		const ulong fixed = (ulong)D*rest_bytes+overhead_bytes;
+		if(fixed+(ulong)D*fi_bytes>budget) {
+			const ulong fi_buffers = budget>fixed ? (budget-fixed)/fi_bytes : 0ull;
+			if(fi_buffers<=(ulong)slots) print_error("VS_VRAM_MB="+to_string(budget_mb)+" is too small for out-of-core execution with "+to_string(slots)+" slots.");
+			resident = (uint)min(fi_buffers-(ulong)slots, (ulong)D);
+		}
+	}
+	if(resident>=D) {
+		print_info("Out-of-core: all "+to_string(D)+" domains fit, using the in-VRAM path.");
+		return;
+	}
+	slots = min(slots, D-resident);
+	if(Dx!=1u||Dz!=1u) print_error("Out-of-core execution supports domains along y only.");
+#if defined(FORCE_FIELD)||defined(SURFACE)||defined(TEMPERATURE)||defined(PARTICLES)||defined(MOVING_BOUNDARIES)
+	print_error("Out-of-core execution supports the plain fluid solver only.");
+#endif // FORCE_FIELD||SURFACE||TEMPERATURE||PARTICLES||MOVING_BOUNDARIES
+	for(uint d=0u; d<D; d++) {
+		if(device_infos[d].uses_ram) print_error("Out-of-core execution needs a GPU with its own memory.");
+		if(device_infos[d].cl_device()!=device_infos[0].cl_device()||device_infos[d].cl_context()!=device_infos[0].cl_context()) print_error("Out-of-core execution supports a single GPU only.");
+	}
+	ooc.active = true;
+	ooc.resident = resident;
+	ooc.slots = slots;
+	ooc.fi_bytes = fi_bytes;
+	const cl::Context& context = device_infos[0].cl_context;
+	int error = 0;
+	ooc.queue_up = cl::CommandQueue(context, device_infos[0].cl_device, 0, &error);
+	ooc_check(error, "upload queue creation");
+	ooc.queue_down = cl::CommandQueue(context, device_infos[0].cl_device, 0, &error);
+	ooc_check(error, "download queue creation");
+	for(uint s=0u; s<slots; s++) {
+		ooc.slot_fi.emplace_back(context, CL_MEM_READ_WRITE, fi_bytes, nullptr, &error);
+		ooc_check(error, "slot allocation");
+	}
+	ooc.slot_of.assign(D, -1);
+	ooc.host_fi.assign(D, nullptr);
+	for(uint d=resident; d<D; d++) {
+		ooc.slot_of[d] = (int)((d-resident)%slots);
+		ooc.host_fi[d] = (fpxx*)ooc_pinned(context, fi_bytes);
+	}
+	ooc.stage_bytes[0] = ((area*17ull+4095ull)/4096ull)*4096ull;
+	ooc.stage_bytes[1] = ((area*(ulong)transfers*(ulong)sizeof(fpxx)+4095ull)/4096ull)*4096ull;
+	char* block = (char*)ooc_pinned(context, 4ull*(ulong)D*(ooc.stage_bytes[0]+ooc.stage_bytes[1]));
+	for(uint f=0u; f<2u; f++) for(uint g=0u; g<2u; g++) for(uint side=0u; side<2u; side++) {
+		ooc.stage[f][g][side].assign(D, nullptr);
+		for(uint d=0u; d<D; d++) {
+			ooc.stage[f][g][side][d] = block;
+			block += ooc.stage_bytes[f];
+		}
+	}
+	ooc.slot_free.assign(slots, cl::Event());
+	ooc.host_fi_ready.assign(D, cl::Event());
+	for(uint g=0u; g<2u; g++) ooc.extract_done[g].assign(D, cl::Event());
+	const ulong device_bytes = (ulong)D*rest_bytes+(ulong)(resident+slots)*fi_bytes+overhead_bytes;
+	const ulong host_bytes = (ulong)(D-resident)*fi_bytes+4ull*(ulong)D*(ooc.stage_bytes[0]+ooc.stage_bytes[1]);
+	print_info("Out-of-core: "+to_string(D)+" domains, "+to_string(resident)+" resident, "+to_string(D-resident)+" swapped through "+to_string(slots)+" slots; DDFs "+to_string((ulong)(fi_bytes/1048576ull))+" MB per domain; device estimate "+to_string((ulong)(device_bytes/1048576ull))+" MB; pinned host "+to_string((ulong)(host_bytes/1048576ull))+" MB.");
+}
+
+void LBM::ooc_visit(const uint d, const ooc_visit_kind kind, const uint generation, const std::function<void(LBM_Domain&)>& work) {
+	LBM_Domain& domain = *lbm_domain[d];
+	cl::CommandQueue queue = domain.get_device().get_cl_queue();
+	const int slot = ooc.slot_of[d];
+	const uint D=get_D(), dyp=(d+1u)%D, dym=(d+D-1u)%D;
+	const uint fi_cell_bytes = transfers*(uint)sizeof(fpxx);
+	vector<cl::Event> wait;
+	if(slot>=0) {
+		vector<cl::Event> before_upload;
+		if(ooc.slot_free[(uint)slot]()) before_upload.push_back(ooc.slot_free[(uint)slot]);
+		if(kind==ooc_init) {
+			wait = before_upload;
+		} else {
+			if(ooc.host_fi_ready[d]()) before_upload.push_back(ooc.host_fi_ready[d]);
+			cl::Event uploaded;
+			ooc_check(ooc.queue_up.enqueueWriteBuffer(ooc.slot_fi[(uint)slot], CL_FALSE, 0ull, ooc.fi_bytes, ooc.host_fi[d], before_upload.empty() ? nullptr : &before_upload, &uploaded), "upload");
+			wait.push_back(uploaded);
+			ooc.uploaded += ooc.fi_bytes;
+		}
+	}
+	const bool insert = kind!=ooc_init&&ooc.pending_fi;
+	const uint pending = ooc.pending_generation;
+	if(insert) {
+		if(ooc.extract_done[pending][dyp]()) wait.push_back(ooc.extract_done[pending][dyp]);
+		if(dym!=dyp&&ooc.extract_done[pending][dym]()) wait.push_back(ooc.extract_done[pending][dym]);
+	}
+	if(!wait.empty()) ooc_check(queue.enqueueBarrierWithWaitList(&wait), "barrier");
+	if(insert) {
+		if(ooc.pending_rho_u_flags) domain.enqueue_transfer_insert_host(domain.kernel_transfer[enum_transfer_field::rho_u_flags][1], 1u, 17u, ooc.pending_t, ooc.stage[0][pending][1][dyp], ooc.stage[0][pending][0][dym]);
+		domain.enqueue_transfer_insert_host(domain.kernel_transfer[enum_transfer_field::fi][1], 1u, fi_cell_bytes, ooc.pending_t, ooc.stage[1][pending][1][dyp], ooc.stage[1][pending][0][dym]);
+	}
+	if(kind==ooc_step) {
+		domain.enqueue_stream_collide();
+		domain.enqueue_transfer_extract_host(domain.kernel_transfer[enum_transfer_field::rho_u_flags][0], 1u, 17u, domain.get_t(), ooc.stage[0][generation][0][d], ooc.stage[0][generation][1][d]);
+	}
+	if(kind==ooc_init) domain.enqueue_initialize();
+	if(kind!=ooc_work) domain.enqueue_transfer_extract_host(domain.kernel_transfer[enum_transfer_field::fi][0], 1u, fi_cell_bytes, domain.get_t(), ooc.stage[1][generation][0][d], ooc.stage[1][generation][1][d]);
+	if(work) work(domain);
+	cl::Event done;
+	ooc_check(queue.enqueueMarkerWithWaitList(nullptr, &done), "marker");
+	if(kind!=ooc_work) ooc.extract_done[generation][d] = done;
+	vector<cl::Event>& window = ooc.in_flight[ooc.pass%2ull];
+	window.push_back(done);
+	if(slot>=0) {
+		if(kind==ooc_work) {
+			ooc.slot_free[(uint)slot] = done;
+		} else {
+			vector<cl::Event> after(1, done);
+			cl::Event downloaded;
+			ooc_check(ooc.queue_down.enqueueReadBuffer(ooc.slot_fi[(uint)slot], CL_FALSE, 0ull, ooc.fi_bytes, ooc.host_fi[d], &after, &downloaded), "download");
+			ooc.downloaded += ooc.fi_bytes;
+			ooc.host_fi_ready[d] = downloaded;
+			ooc.slot_free[(uint)slot] = downloaded;
+			window.push_back(downloaded);
+		}
+	}
+}
+
+void LBM::ooc_time_step() {
+	vector<cl::Event>& window = ooc.in_flight[ooc.pass%2ull];
+	if(!window.empty()) {
+		ooc_check(cl::Event::waitForEvents(window), "pipeline wait");
+		window.clear();
+	}
+	const uint generation = ooc.pending_fi ? 1u-ooc.pending_generation : 0u;
+	const ulong t = lbm_domain[0]->get_t();
+	for(uint d=0u; d<get_D(); d++) ooc_visit(d, ooc_step, generation, nullptr);
+	ooc.pending_fi = true;
+	ooc.pending_rho_u_flags = true;
+	ooc.pending_t = t;
+	ooc.pending_generation = generation;
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->increment_time_step();
+	ooc.pass++;
+}
+
+void LBM::ooc_finish() {
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	ooc_check(ooc.queue_up.finish(), "upload queue finish");
+	ooc_check(ooc.queue_down.finish(), "download queue finish");
+	ooc.in_flight[0].clear();
+	ooc.in_flight[1].clear();
+}
+
+void LBM::print_field_hashes() {
+	update_fields();
+	const auto fnv = [](const void* data, const ulong bytes, ulong hash) {
+		const uchar* p = (const uchar*)data;
+		for(ulong i=0ull; i<bytes; i++) hash = (hash^(ulong)p[i])*1099511628211ull;
+		return hash;
+	};
+	for(uint d=0u; d<get_D(); d++) {
+		LBM_Domain& domain = *lbm_domain[d];
+		const ulong N = domain.get_N();
+		vector<float> rho_h(N), u_h(3ull*N);
+		vector<uchar> flags_h(N);
+		vector<fpxx> fi_h(N*(ulong)velocity_set);
+		const auto read = [&](LBM_Domain& source) {
+			cl::CommandQueue queue = source.get_device().get_cl_queue();
+			ooc_check(queue.enqueueReadBuffer(source.rho.get_cl_buffer(), CL_FALSE, 0ull, N*4ull, rho_h.data()), "hash read");
+			ooc_check(queue.enqueueReadBuffer(source.u.get_cl_buffer(), CL_FALSE, 0ull, 3ull*N*4ull, u_h.data()), "hash read");
+			ooc_check(queue.enqueueReadBuffer(source.flags.get_cl_buffer(), CL_FALSE, 0ull, N, flags_h.data()), "hash read");
+			ooc_check(queue.enqueueReadBuffer(source.fi.get_cl_buffer(), CL_FALSE, 0ull, N*(ulong)velocity_set*sizeof(fpxx), fi_h.data()), "hash read");
+		};
+		if(ooc.active) {
+			ooc_visit(d, ooc_work, 0u, read);
+			ooc_finish();
+		} else {
+			read(domain);
+			domain.finish_queue();
+		}
+		const ulong basis = 14695981039346656037ull;
+		const ulong local_Nx=(ulong)domain.get_Nx(), local_Ny=(ulong)domain.get_Ny();
+		const ulong halo = (ulong)(get_Dy()>1u);
+		ulong fi_hash = basis;
+		for(uint i=0u; i<velocity_set; i++) {
+			for(ulong n=0ull; n<N; n++) {
+				const ulong y = (n/local_Nx)%local_Ny;
+				if(y<halo||y+halo>=local_Ny) continue;
+				fi_hash = fnv(&fi_h[(ulong)i*N+n], sizeof(fpxx), fi_hash);
+			}
+		}
+		fprintf(stdout, "hash domain %u rho %016llx u %016llx flags %016llx fi_interior %016llx\n", d, (unsigned long long)fnv(rho_h.data(), N*4ull, basis), (unsigned long long)fnv(u_h.data(), 3ull*N*4ull, basis), (unsigned long long)fnv(flags_h.data(), N, basis), (unsigned long long)fi_hash);
+	}
+	fflush(stdout);
+}

@@ -147,6 +147,10 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+R(int colorscale_twocolor(float x) { // coloring scheme (float [0, 1] -> int color)
 	return x>0.5f ? color_mix(0xFFAA00, def_background_color, clamp(2.0f*x-1.0f, 0.0f, 1.0f)) : color_mix(def_background_color, 0x0080FF, clamp(2.0f*x, 0.0f, 1.0f)); // red - gray - blue
 }
+)+R(int hull_tint(const float x) {
+	const float a = clamp(2.0f*x, -1.0f, 1.0f);
+	return a>0.0f ? color_mix(0xFF7A30, def_hull_color, a) : color_mix(0x2A80FF, def_hull_color, -a);
+}
 )+R(int shading(const int c, const float3 p, const float3 normal, const float* camera_cache) { // calculate flat shading color of triangle
 )+"#ifndef GRAPHICS_TRANSPARENCY"+R(
 	const float zoom = camera_cache[ 0]; // fetch camera parameters (rotation matrix, camera position, etc.)
@@ -348,6 +352,16 @@ string opencl_c_container() { return R( // ########################## begin of O
 	const int vr = (as_int(camera_cache[14])>>31)&0x1;
 	if(vr) convert_triangle_interpolated(p0, p1, p2, c0, c1, c2, camera_cache, bitmap, zbuffer, -1); // left eye
 	/****/ convert_triangle_interpolated(p0, p1, p2, c0, c1, c2, camera_cache, bitmap, zbuffer, vr); // right eye
+}
+)+R(kernel void graphics_snapshot_hull(const global int* bitmap, global int* hull_bitmap) {
+	const uint n = get_global_id(0);
+	if(n>=def_screen_width*def_screen_height) return;
+	hull_bitmap[n] = bitmap[n];
+}
+)+R(kernel void graphics_composite_flow(global int* bitmap, const global int* hull_bitmap, const float opacity) {
+	const uint n = get_global_id(0);
+	if(n>=def_screen_width*def_screen_height) return;
+	bitmap[n] = color_mix(bitmap[n], hull_bitmap[n], opacity);
 }
 )+R(kernel void graphics_clear(global int* bitmap, global int* zbuffer) {
 	const uint n = get_global_id(0);
@@ -2600,12 +2614,12 @@ string opencl_c_container() { return R( // ########################## begin of O
 		const float3 p0 = triangle_vertices[vertex_indices[3u*i   ]]; // triangle coordinates in [0,1] (local cell)
 		const float3 p1 = triangle_vertices[vertex_indices[3u*i+1u]];
 		const float3 p2 = triangle_vertices[vertex_indices[3u*i+2u]];
-		int c0=0xDFDFDF, c1=0xDFDFDF, c2=0xDFDFDF;
+		int c0=def_hull_color, c1=def_hull_color, c2=def_hull_color;
 )+"#ifdef FORCE_FIELD"+R(
 		const float3 normal = normalize(cross(p1-p0, p2-p0));
-		c0 = colorscale_twocolor(0.5f+def_scale_F*dot(trilinear3(p0, Fj), normal));
-		c1 = colorscale_twocolor(0.5f+def_scale_F*dot(trilinear3(p1, Fj), normal));
-		c2 = colorscale_twocolor(0.5f+def_scale_F*dot(trilinear3(p2, Fj), normal));
+		c0 = hull_tint(def_scale_F*dot(trilinear3(p0, Fj), normal));
+		c1 = hull_tint(def_scale_F*dot(trilinear3(p1, Fj), normal));
+		c2 = hull_tint(def_scale_F*dot(trilinear3(p2, Fj), normal));
 )+"#else"+R( // FORCE_FIELD
 		const float3 normal = cross(p1-p0, p2-p0); // no normalize needed for shading()
 )+"#endif"+R( // FORCE_FIELD
@@ -2837,13 +2851,14 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#endif"+R( // D2Q9
 	if((slice_mode==1&&rx)||(slice_mode==2&&ry)||(slice_mode==3&&rz)||(slice_mode==4&&rx&&rz)||(slice_mode==5&&rx&&ry&&rz)||(slice_mode==6&&ry&&rz)||(slice_mode==7&&rx&&ry)) return;
 	if((slice_mode==1||slice_mode==5||slice_mode==4||slice_mode==7)&!rx) p.x = ps.x; // snap streamline position to slice position
+	if(fabs(p.x)>def_rake_x||p.z<def_rake_z0||p.z>def_rake_z1) return;
 	if((slice_mode==2||slice_mode==5||slice_mode==6||slice_mode==7)&!ry) p.y = ps.y;
 	if((slice_mode==3||slice_mode==5||slice_mode==4||slice_mode==6)&!rz) p.z = ps.z;
 	float camera_cache[15]; // cache camera parameters in case the kernel draws more than one shape
 	for(uint i=0u; i<15u; i++) camera_cache[i] = camera[i];
 	const float hLx=0.5f*(float)(def_Nx-2u*(def_Dx>1u)), hLy=0.5f*(float)(def_Ny-2u*(def_Dy>1u)), hLz=0.5f*(float)(def_Nz-2u*(def_Dz>1u));
 	//draw_circle(p, 0.5f*def_streamline_sparse, 0xFFFFFF, camera_cache, bitmap, zbuffer);
-	for(float dt=-1.0f; dt<=1.0f; dt+=2.0f) { // integrate forward and backward in time
+	for(float dt=def_streamline_dt0; dt<=1.0f; dt+=2.0f) { // integrate forward and backward in time
 		float3 p0, p1=p;
 		for(uint l=0u; l<def_streamline_length/2u; l++) {
 			const uint x = (uint)(p1.x+1.5f*(float)def_Nx)%def_Nx;
@@ -2896,7 +2911,26 @@ string opencl_c_container() { return R( // ########################## begin of O
 	draw_line(p-(0.5f/ul)*un, p+(0.5f/ul)*un, c, camera_cache, bitmap, zbuffer);
 }
 
-)+R(kernel void graphics_q)+"("+R(const global float* camera, global int* bitmap, global int* zbuffer, const int field_mode, const global float* rho, const global float* u // ) {
+)+R(kernel void sample_state(const global float* rho, const global float* u, const global uchar* flags, global float4* values, const uint count) {
+	const uint i = get_global_id(0);
+	if(i>=count) return;
+	const uxx n = (uxx)((ulong)i*((ulong)def_N-1ul)/(ulong)(count-1u));
+	values[i] = is_halo(n)||(flags[n]&TYPE_S) ? (float4)(1.0f, 0.0f, 0.0f, 0.0f) : (float4)(rho[n], load3(u, n));
+}
+)+R(kernel void graphics_mesh(const global float* camera, global int* bitmap, global int* zbuffer, const global float* mesh_p) {
+	const uint n = get_global_id(0);
+	float camera_cache[15];
+	for(uint i=0u; i<15u; i++) camera_cache[i] = camera[i];
+	const float3 domain_offset = (float3)(def_domain_offset_x, def_domain_offset_y, def_domain_offset_z);
+	const float3 p0 = (float3)(mesh_p[9u*n   ], mesh_p[9u*n+1u], mesh_p[9u*n+2u])-domain_offset;
+	const float3 p1 = (float3)(mesh_p[9u*n+3u], mesh_p[9u*n+4u], mesh_p[9u*n+5u])-domain_offset;
+	const float3 p2 = (float3)(mesh_p[9u*n+6u], mesh_p[9u*n+7u], mesh_p[9u*n+8u])-domain_offset;
+	const float3 normal = cross(p1-p0, p2-p0);
+	const int c = shading(def_hull_color, 0.33333334f*(p0+p1+p2), normal, camera_cache);
+	draw_triangle(p0, p1, p2, c, camera_cache, bitmap, zbuffer);
+}
+
+)+R(kernel void graphics_q)+"("+R(const global float* camera, global int* bitmap, global int* zbuffer, const int field_mode, const float q_min, const global float* rho, const global float* u // ) {
 )+"#ifdef SURFACE"+R(
 	, const global uchar* flags // argument order is important
 )+"#endif"+R( // SURFACE
@@ -2999,7 +3033,7 @@ string opencl_c_container() { return R( // ########################## begin of O
 	v[7] = calculate_Q_cached(uj[ 6], uk[21], uk[22], uj[ 3], uk[23], uj[ 4]);
 	float3 triangle_vertices[12]; // 12 triangle vertices for marching_cubes (return 12 vertices instead of 15 triangles to save register space)
 	uchar vertex_indices[15]; // maximum of 5 triangles with 3 vertices each
-	const uint tn = marching_cubes(v, def_scale_Q_min, triangle_vertices, vertex_indices); // run marching cubes algorithm
+	const uint tn = marching_cubes(v, q_min, triangle_vertices, vertex_indices); // run marching cubes algorithm
 	if(tn==0u) return;
 	switch(field_mode) {
 		case 1: // coloring by density

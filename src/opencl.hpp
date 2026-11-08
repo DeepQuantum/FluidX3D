@@ -349,6 +349,7 @@ private:
 	bool device_buffer_exists = false;
 	bool external_host_buffer = false; // Memory object has been created with an externally supplied host buffer/pointer
 	bool is_zero_copy = false; // if possible (device is CPU or iGPU), and if allowed by user, use zero-copy buffer: host+device buffers are fused into one
+	bool shared_device_buffer = false;
 	T* host_buffer = nullptr; // host buffer
 	T* host_buffer_unaligned = nullptr; // unaligned host buffer (only required for zero-copy to align host_buffer)
 	cl::Buffer device_buffer; // device buffer
@@ -414,6 +415,21 @@ public:
 		allocate_device_buffer(device, allocate_device, allow_zero_copy);
 		write_to_device();
 	}
+	inline Memory(Device& device, const ulong N, const uint dimensions, T* const host_buffer, const cl::Buffer& device_buffer) {
+		if(!device.is_initialized()) print_error("No Device selected. Call Device constructor.");
+		if(N*(ulong)dimensions==0ull) print_error("Memory size must be larger than 0.");
+		this->N = N;
+		this->d = dimensions;
+		this->host_buffer = host_buffer;
+		initialize_auxiliary_pointers();
+		host_buffer_exists = true;
+		external_host_buffer = true;
+		this->device = &device;
+		this->cl_queue = device.get_cl_queue();
+		this->device_buffer = device_buffer;
+		device_buffer_exists = true;
+		shared_device_buffer = true;
+	}
 	inline Memory() {} // default constructor
 	inline ~Memory() {
 		delete_buffers();
@@ -433,7 +449,8 @@ public:
 		}
 		if(memory.device_buffer_exists) {
 			device_buffer = memory.get_cl_buffer(); // transfer device_buffer pointer
-			device->info.memory_used += (uint)(capacity()/1048576ull); // track device memory usage
+			shared_device_buffer = memory.shared_device_buffer;
+			if(!shared_device_buffer) device->info.memory_used += (uint)(capacity()/1048576ull); // track device memory usage
 			is_zero_copy = memory.is_zero_copy;
 			device_buffer_exists = true;
 		}
@@ -472,6 +489,7 @@ public:
 		if(!external_host_buffer) {
 			host_buffer = nullptr;
 			delete[] host_buffer_unaligned;
+			host_buffer_unaligned = nullptr;
 		}
 		if(!device_buffer_exists) {
 			N = 0ull;
@@ -479,8 +497,9 @@ public:
 		}
 	}
 	inline void delete_device_buffer() {
-		if(device_buffer_exists) device->info.memory_used -= (uint)(capacity()/1048576ull); // track device memory usage
+		if(device_buffer_exists&&!shared_device_buffer) device->info.memory_used -= (uint)(capacity()/1048576ull); // track device memory usage
 		device_buffer_exists = false;
+		shared_device_buffer = false;
 		device_buffer = nullptr;
 		if(!host_buffer_exists) {
 			N = 0ull;
