@@ -3399,7 +3399,7 @@ inline void print_color(const int textcolor) {
 	static const HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
 	SetConsoleTextAttribute(handle, textcolor);
 #else // Linux
-	std::cout << get_print_color(textcolor);
+	if(isatty(STDOUT_FILENO)) std::cout << get_print_color(textcolor);
 #endif // Windows/Linux
 }
 inline void print_color(const int textcolor, const int backgroundcolor) {
@@ -3407,7 +3407,7 @@ inline void print_color(const int textcolor, const int backgroundcolor) {
 	static const HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
 	SetConsoleTextAttribute(handle, backgroundcolor<<4|textcolor);
 #else // Linux
-	std::cout << get_print_color(textcolor, backgroundcolor);
+	if(isatty(STDOUT_FILENO)) std::cout << get_print_color(textcolor, backgroundcolor);
 #endif // Windows/Linux
 }
 inline void print_color_reset() {
@@ -3415,7 +3415,7 @@ inline void print_color_reset() {
 	static const HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
 	SetConsoleTextAttribute(handle, 7); // reset color
 #else // Linux
-	std::cout << "\033[0m"; // reset color
+	if(isatty(STDOUT_FILENO)) std::cout << "\033[0m"; // reset color
 #endif // Windows/Linux
 }
 inline void print(const string& s, const int textcolor) {
