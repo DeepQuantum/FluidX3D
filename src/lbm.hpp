@@ -164,6 +164,7 @@ public:
 		Memory<int> hull_bitmap;
 		Kernel kernel_snapshot_hull, kernel_composite_flow;
 		float flow_opacity = 1.0f;
+		bool hull_snapshot = false;
 		Memory<float> camera_parameters; // contains camera position, rotation, field of view etc.
 
 		LBM_Domain* lbm = nullptr;
@@ -213,6 +214,9 @@ public:
 		bool enqueue_draw_frame(const int visualization_modes, const int field_mode=0, const int slice_mode=0, const int slice_x=0, const int slice_y=0, const int slice_z=0, const bool visualization_change=true); // main rendering function, calls rendering kernels, returns true if new frame is rendered, false if old frame is returned when camera has not moved
 		int* get_bitmap(); // returns pointer to bitmap
 		int* get_zbuffer(); // returns pointer to zbuffer
+		int* get_hull_bitmap() { return hull_bitmap.data(); }
+		float get_flow_opacity() const { return flow_opacity; }
+		bool hull_snapshot_taken() const { return hull_snapshot; }
 		string device_defines(const Device_Info& device_info) const; // returns preprocessor constants for embedding in OpenCL C code
 	}; // Graphics
 	Graphics graphics;

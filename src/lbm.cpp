@@ -497,7 +497,7 @@ void LBM_Domain::Graphics::allocate(Device& device) {
 	kernel_clear = Kernel(device, bitmap.length(), "graphics_clear", bitmap, zbuffer);
 	flow_opacity = clamp(vs_env_float("VS_FLOW_OPACITY", 1.0f), 0.0f, 1.0f);
 	if(flow_opacity<1.0f) {
-		hull_bitmap = Memory<int>(device, bitmap.length(), 1u, false, true);
+		hull_bitmap = Memory<int>(device, bitmap.length(), 1u, lbm->get_D()>1u, true);
 		kernel_snapshot_hull = Kernel(device, bitmap.length(), "graphics_snapshot_hull", bitmap, hull_bitmap);
 		kernel_composite_flow = Kernel(device, bitmap.length(), "graphics_composite_flow", bitmap, hull_bitmap, flow_opacity);
 	}
@@ -602,9 +602,10 @@ bool LBM_Domain::Graphics::enqueue_draw_frame(const int visualization_modes, con
 	if(visualization_modes&VIS_STREAMLINES) kernel_graphics_streamline.set_parameters(3u, field_mode, slice_mode, sx, sy, sz).enqueue_run();
 	if((visualization_modes&VIS_MESH)&&mesh_triangles>0ull) kernel_graphics_mesh.enqueue_run();
 	const bool composite_flow = flow_opacity<1.0f&&(visualization_modes&VIS_MESH)&&(visualization_modes&VIS_Q_CRITERION)&&mesh_triangles>0ull;
+	hull_snapshot = composite_flow;
 	if(composite_flow) kernel_snapshot_hull.enqueue_run();
 	if(visualization_modes&VIS_Q_CRITERION) kernel_graphics_q.set_parameters(3u, field_mode, vs_q_runtime).enqueue_run();
-	if(composite_flow) kernel_composite_flow.enqueue_run();
+	if(composite_flow&&lbm->get_D()==1u) kernel_composite_flow.enqueue_run();
 #ifdef PARTICLES
 	if(visualization_modes&VIS_PARTICLES) kernel_graphics_particles.enqueue_run();
 #endif // PARTICLES
@@ -637,6 +638,7 @@ bool LBM_Domain::Graphics::enqueue_draw_frame(const int visualization_modes, con
 	}
 	bitmap.enqueue_read_from_device();
 	if(lbm->get_D()>1u) zbuffer.enqueue_read_from_device();
+	if(composite_flow&&lbm->get_D()>1u) hull_bitmap.enqueue_read_from_device();
 	return true; // new frame has been rendered
 }
 int* LBM_Domain::Graphics::get_bitmap() { // returns pointer to zbuffer
@@ -1309,6 +1311,11 @@ int* LBM::Graphics::draw_frame() {
 			bitmap[i] = color_add(bitmap[i], bitmap_d[i]);
 #endif // GRAPHICS_TRANSPARENCY
 		}
+	}
+	if(new_frame&&lbm->get_D()>1u&&lbm->lbm_domain[0]->graphics.hull_snapshot_taken()) {
+		const int* const hull = lbm->lbm_domain[0]->graphics.get_hull_bitmap();
+		const float w = lbm->lbm_domain[0]->graphics.get_flow_opacity();
+		for(uint i=0u; i<camera.width*camera.height; i++) bitmap[i] = color_mix(bitmap[i], hull[i], w);
 	}
 	camera.allow_labeling = new_frame; // only print new label on frame if a new frame has been rendered
 	return bitmap;
